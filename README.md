@@ -20,6 +20,36 @@ go_melt_folder=GO_MELT \
 && python3 go_melt/go_melt.py
 ```
 
+## Visualization
+
+GO-MELT outputs VTK Rectilinear Grid files (`.vtr`) that can be visualized using several methods:
+
+### Quick Visualization
+```bash
+# Install visualization dependencies
+pip install pyvista  # Recommended for 3D visualization
+
+# Visualize results
+python visualize_simple.py results/example/Level3_00000001.vtr
+```
+
+### Advanced Visualization
+```bash
+# List available files
+python visualize_results.py results/example/ --list
+
+# Create animation
+python visualize_results.py results/example/ --animate --level 3 --output animation.gif
+
+# View accumulated melt time
+python visualize_results.py results/example/ --accum-time
+```
+
+### Using ParaView
+The `.vtr` files can also be opened directly in [ParaView](https://www.paraview.org/) for advanced visualization and analysis.
+
+For detailed visualization instructions, see [VISUALIZATION.md](VISUALIZATION.md).
+
 ## Citations
 
 If you found this library useful in academic or industry work, we appreciate your support if you consider:

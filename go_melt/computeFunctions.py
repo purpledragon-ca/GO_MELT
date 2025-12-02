@@ -1845,24 +1845,28 @@ def update_overlap_nodes_coords_L2(Level, vcon, element_size, ele_ratio):
     return Level
 
 
-@partial(jax.jit, static_argnames=["_idx", "_val"])
+@jax.jit
 def substitute_Tbar(Tbar, _idx, _val):
     """
     Replace a slice of the Tbar array starting at a given index with a new value.
 
     This function sets all elements from index `_idx` to the end of the array
-    to the value `_val`. The index and value are treated as static arguments
-    for JAX compilation efficiency.
+    to the value `_val`. Uses a mask-based approach to handle dynamic indices.
 
     Parameters:
     Tbar (array): Input array to be modified.
-    _idx (int): Starting index for substitution.
+    _idx (int or array): Starting index for substitution (can be traced).
     _val (float or array): Value(s) to assign from _idx onward.
 
     Returns:
     array: Modified Tbar array with values substituted from _idx onward.
     """
-    return Tbar.at[_idx:].set(_val)
+    # Create a mask for indices >= _idx
+    # Use jnp.arange to create indices, then compare with _idx
+    indices = jnp.arange(Tbar.shape[0])
+    mask = indices >= _idx
+    # Use jnp.where to conditionally set values
+    return jnp.where(mask, _val, Tbar)
 
 
 @jax.jit
