@@ -18,7 +18,39 @@ def parsingGcode(Nonmesh, Properties, L2h):
 
     # Open and read the Gcode file
     with open(Nonmesh["gcode"], "r") as gcode_file:
-        gcode = gcode_file.read()
+        gcode_lines = gcode_file.readlines()
+        gcode = "".join(gcode_lines)
+
+    # Parse GCODE line by line to extract power commands
+    # Track current power (defaults to Properties laser_power)
+    current_power = Properties["laser_power"]
+    power_map = {}  # Map line index to power value
+    
+    # Patterns for power commands:
+    # S### - Spindle speed (laser power) - standalone or with G commands
+    # M3 S### or M4 S### - Spindle on with power
+    # M106 S### - Fan/laser power (3D printer style)
+    # Check M commands first to avoid double-matching
+    for line_idx, line in enumerate(gcode_lines):
+        power_found = False
+        # Check for M3/M4/M106 with S parameter first
+        m_match = re.search(r"M(?:3|4|106)\s+S(-?\d+\.\d+|-?\d+)", line, re.IGNORECASE)
+        if m_match:
+            power_val = float(m_match.group(1))
+            current_power = power_val
+            power_map[line_idx] = current_power
+            power_found = True
+        
+        # Check for standalone S command (if not already found in M command)
+        if not power_found:
+            s_match = re.search(r"\bS(-?\d+\.\d+|-?\d+)\b", line, re.IGNORECASE)
+            if s_match:
+                power_val = float(s_match.group(1))
+                current_power = power_val
+                power_map[line_idx] = current_power
+            else:
+                # No power command on this line, use previous power
+                power_map[line_idx] = current_power
 
     # First pattern to match either X, Y, or Z coordinates
     pattern1 = (
@@ -27,24 +59,45 @@ def parsingGcode(Nonmesh, Properties, L2h):
     )
     matches = re.findall(pattern1, gcode)
 
+    # Find which line each match comes from
+    line_starts = [0]
+    for line in gcode_lines:
+        line_starts.append(line_starts[-1] + len(line))
+    
     # Laser center coordinate (LCC) list (which is read by GO-MELT)
+    # Format: (x, y, z, skip_segment, power)
     LCC = []
     current_z = None  # Default z-coordinate is 0.0
     skip_segment = 0.0
     move_mesh = 0
+    
+    # Find line index for each match
+    match_positions = []
+    for match in re.finditer(pattern1, gcode):
+        pos = match.start()
+        # Find which line this match is on
+        line_idx = 0
+        for i in range(len(line_starts) - 1):
+            if line_starts[i] <= pos < line_starts[i + 1]:
+                line_idx = i
+                break
+        match_positions.append(line_idx)
 
-    for current_match in matches:
+    for match_idx, current_match in enumerate(matches):
+        line_idx = match_positions[match_idx] if match_idx < len(match_positions) else 0
+        power = power_map.get(line_idx, current_power)
+        
         if current_match[0] != "1":  # command found, skip the segment
             skip_segment = 1.0
             if current_match[3]:  # Z-coordinate for the layer
                 current_z = float(current_match[3])
             x, y, z = float(current_match[1]), float(current_match[2]), current_z
-            LCC.append((x, y, z, skip_segment))
+            LCC.append((x, y, z, skip_segment, power))
         else:  # X and Y coordinates
             if current_match[3]:  # Z-coordinate for the layer
                 current_z = float(current_match[3])
             x, y, z = float(current_match[1]), float(current_match[2]), current_z
-            LCC.append((x, y, z, skip_segment))
+            LCC.append((x, y, z, skip_segment, power))
         skip_segment = 0.0
 
     dx = Nonmesh["laser_velocity"] * Nonmesh["timestep_L3"]
@@ -56,6 +109,8 @@ def parsingGcode(Nonmesh, Properties, L2h):
         for i in range(len(LCC) - 1):
             # Ljump == 0 during jump in laser path, Ldwell == 0 during dwell time
             Ljump, Ldwell = 1, 1
+            # Get power for this segment (use power from current point, or next if available)
+            segment_power = LCC[i][4] if len(LCC[i]) > 4 else Properties["laser_power"]
 
             # Check if z-coordinates are different
             if LCC[i][2] != LCC[i + 1][2]:
@@ -128,7 +183,7 @@ def parsingGcode(Nonmesh, Properties, L2h):
             for j in range(num_pointsinSegments):
                 new_x += dx_segment * Nonmesh["timestep_L3"]
                 new_y += dy_segment * Nonmesh["timestep_L3"]
-                _P = Ljump * Properties["laser_power"]
+                _P = Ljump * segment_power
                 toolpath.write(
                     f"{format_fixed(new_x)},{format_fixed(new_y)},{format_fixed(z)},"
                     f"{Ljump:d},{Ldwell:d},{Nonmesh['timestep_L3']:.8e},{_P:.8e}\n"
@@ -148,7 +203,7 @@ def parsingGcode(Nonmesh, Properties, L2h):
                 z = LCC[i][2]
                 new_x += dx_segment * shortdt
                 new_y += dy_segment * shortdt
-                _P = Ljump * Properties["laser_power"]
+                _P = Ljump * segment_power
                 toolpath.write(
                     f"{format_fixed(new_x)},{format_fixed(new_y)},{format_fixed(z)},"
                     f"{Ljump:d},{Ldwell:d},{shortdt:.8e},{_P:.8e}\n"

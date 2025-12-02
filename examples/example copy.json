@@ -121,7 +121,7 @@
         "Level1_record_step": 1,
         "laser_velocity": 1000,
         "save_path": "./results/example/",
-        "gcode": "./examples/gcodefiles/example_with_power.gcode",
+        "gcode": "./examples/gcodefiles/example.gcode",
         "toolpath": "./results/example/toolpath.txt",
         "layer_num": 0,
         "subcycle_num_L2": 5,
