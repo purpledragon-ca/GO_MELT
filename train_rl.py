@@ -28,6 +28,7 @@ except ImportError:
     print("Warning: stable-baselines3 not installed. Install with: pip install stable-baselines3[extra]")
 
 from go_melt_env import GoMeltEnv
+from observation_utils import print_observation_breakdown
 
 
 def create_training_config(
@@ -139,6 +140,48 @@ def train_rl_agent(
         env = Monitor(env, str(output_path / "monitor"))
         return env
     
+    # Validate environment before training
+    print("\nValidating environment...")
+    try:
+        test_env = make_env()
+        # Get unwrapped environment (in case it's wrapped by Monitor)
+        unwrapped_env = test_env.unwrapped if hasattr(test_env, 'unwrapped') else test_env
+        test_obs, test_info = test_env.reset()
+        print(f"✓ Environment created successfully")
+        print(f"  Observation space: {test_env.observation_space}")
+        print(f"  Action space: {test_env.action_space}")
+        print(f"  Initial observation shape: {test_obs.shape}")
+        
+        # Print observation breakdown using shared utility
+        obs_config = unwrapped_env.observation_config if hasattr(unwrapped_env, 'observation_config') else {}
+        
+        print_observation_breakdown(
+            observation=test_obs,
+            observation_config=obs_config,
+            history_length=unwrapped_env.observation_history_length,
+            power_min=unwrapped_env.power_min,
+            power_max=unwrapped_env.power_max,
+            temp_min=unwrapped_env.temp_min,
+            temp_max=unwrapped_env.temp_max,
+            prefix="  "
+        )
+        
+        # Test a step
+        test_action = test_env.action_space.sample()
+        test_obs, test_reward, test_term, test_trunc, test_info = test_env.step(test_action)
+        print(f"\n  Test step successful:")
+        print(f"    Action: {test_action[0]:.4f} (normalized)")
+        print(f"    Reward: {test_reward:.4f}")
+        print(f"    Temperature: {test_info['temperature']:.2f}K")
+        print(f"    Power: {test_info['power']:.2f}W")
+        print(f"    Terminated: {test_term}, Truncated: {test_trunc}")
+        test_env.close()
+    except Exception as e:
+        print(f"✗ Environment validation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+    
     if n_envs > 1:
         env = make_vec_env(make_env, n_envs=n_envs)
     else:
@@ -235,7 +278,14 @@ def train_rl_agent(
     )
     
     # Train the model
-    print("\nStarting training...")
+    print("\n" + "="*60)
+    print("Starting training...")
+    print("="*60)
+    print(f"Algorithm: {algorithm}")
+    print(f"Total timesteps: {total_timesteps:,}")
+    print(f"Device: {use_device}")
+    print(f"Number of environments: {n_envs}")
+    print("="*60 + "\n")
     start_time = time.time()
     
     try:
@@ -376,9 +426,30 @@ def main():
         print(f"Error: Configuration file not found: {args.config_file}")
         sys.exit(1)
     
+    # Validate config file is valid JSON
+    try:
+        with open(args.config_file, 'r') as f:
+            config_test = json.load(f)
+        print(f"✓ Configuration file loaded successfully")
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON in configuration file: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: Failed to read configuration file: {e}")
+        sys.exit(1)
+    
+    # Check if stable-baselines3 is available
+    if not HAS_SB3:
+        print("Error: stable-baselines3 is required for training.")
+        print("Install with: pip install stable-baselines3[extra]")
+        sys.exit(1)
+    
     # Set GPU device
     if args.device_id >= 0:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device_id)
+        print(f"Using GPU device: {args.device_id}")
+    else:
+        print("Using CPU")
     
     # Train the agent
     try:
@@ -397,7 +468,12 @@ def main():
             max_steps=args.max_steps,
             reward_scale=args.reward_scale
         )
-        print("\n✓ Training completed successfully!")
+        print("\n" + "="*60)
+        print("✓ Training completed successfully!")
+        print("="*60)
+    except KeyboardInterrupt:
+        print("\n\nTraining interrupted by user.")
+        sys.exit(0)
     except Exception as e:
         print(f"\n✗ Training failed: {e}")
         import traceback

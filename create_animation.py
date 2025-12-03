@@ -78,9 +78,14 @@ def create_animation(results_dir, level=3, output_file=None, field='temperature'
     
     print(f"Found {len(files)} files for Level {level}")
     
-    # Set output filename
+    # Set output filename based on folder name
     if output_file is None:
-        output_file = f"animation_level{level}.gif"
+        # Extract folder name from results directory
+        folder_name = os.path.basename(os.path.normpath(results_dir))
+        # Remove any trailing slashes and get just the folder name
+        if not folder_name:
+            folder_name = os.path.basename(os.path.dirname(results_dir))
+        output_file = f"{folder_name}_level{level}.gif"
     
     # Determine field name and colormap
     if field == 'temperature':
@@ -277,9 +282,14 @@ def create_overview_animation(results_dir, output_file=None, field='temperature'
           f"Level 2: {len(all_files.get(2, []))}, "
           f"Level 3: {len(all_files.get(3, []))}")
     
-    # Set output filename
+    # Set output filename based on folder name
     if output_file is None:
-        output_file = "animation_overview.gif"
+        # Extract folder name from results directory
+        folder_name = os.path.basename(os.path.normpath(results_dir))
+        # Remove any trailing slashes and get just the folder name
+        if not folder_name:
+            folder_name = os.path.basename(os.path.dirname(results_dir))
+        output_file = f"{folder_name}_overview.gif"
     
     # Determine field name and colormap
     if field == 'temperature':
@@ -315,7 +325,7 @@ def create_overview_animation(results_dir, output_file=None, field='temperature'
     actors = {}
     
     # Define opacity levels: Level 1 (coarsest) more transparent, Level 3 (finest) fully opaque
-    opacity_levels = {1: 0.3, 2: 0.6, 3: 1.0}
+    opacity_levels = {1: 0.5, 2: 0.7, 3: 0.9}
     
     # Initialize all levels in the same plot
     print("Loading initial meshes for all levels...")

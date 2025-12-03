@@ -1,7 +1,7 @@
 {
   "algorithm": "PPO",
   "total_timesteps": 100000,
-  "training_time_seconds": 186.8388798236847,
+  "training_time_seconds": 183.92790603637695,
   "config_file": "examples/rl.json",
   "env_kwargs": {
     "target_temperature": 3000.0,

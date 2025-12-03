@@ -137,10 +137,30 @@
         "controller_params": {
             "kp": 0.1,
             "power_min": 0.0,
-            "power_max": 500.0, 
-            "rl_model_path": "./checkpoints/final_model.zip"
+            "power_max": 500.0,
+            "observation_history_length": 10,
+            "temp_min": 0.0,
+            "temp_max": 5000.0,
+            "rl_model_path": "./rl_training/final_model.zip",
+            "observation_config": {
+                "enable_max_T_L3": true,
+                "enable_avg_T_L3": true,
+                "enable_min_T_L3": false,
+                "enable_std_T_L3": true,
+                "enable_frac_above_liquidus": true,
+                "enable_accum_time_local": false,
+                "enable_laser_speed": true,
+                "enable_distance_to_last_point": false,
+                "enable_power_history": true,
+                "enable_temperature_history": true,
+                "enable_future_toolpath": true,
+                "enable_history_toolpath": true,
+                "power_history_length": 10,
+                "temperature_history_length": 10,
+                "future_toolpath_length": 10,
+                "history_toolpath_length": 10
+            }
         }
     }
 }
-
 

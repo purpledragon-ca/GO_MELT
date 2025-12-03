@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import argparse
 from datetime import datetime
 from pathlib import Path
 
@@ -20,11 +21,11 @@ if _current_dir not in sys.path:
     sys.path.insert(0, _current_dir)
 
 try:
-    from rl_controller import PowerController, PIDController
+    from controller import RLController, PIDController
     HAS_CONTROLLERS = True
 except ImportError as e:
     HAS_CONTROLLERS = False
-    PowerController = None
+    RLController = None
     PIDController = None
     print(f"Warning: Controllers not found ({str(e)}). Power control disabled.")
 
@@ -120,7 +121,7 @@ def go_melt(solver_input: dict, input_file: str = None):
                 
                 elif controller_type == "rl":
                     # Initialize RL controller
-                    if PowerController is not None:
+                    if RLController is not None:
                         # Set default RL parameters if not provided
                         if "kp" not in controller_params:
                             controller_params["kp"] = 0.1
@@ -132,7 +133,7 @@ def go_melt(solver_input: dict, input_file: str = None):
                         # Check for RL model path
                         rl_model_path = controller_params.get("rl_model_path", None)
                         
-                        power_controller = PowerController(
+                        power_controller = RLController(
                             target_temperature=target_temp,
                             base_power=base_power,
                             update_interval=update_interval,
@@ -143,8 +144,11 @@ def go_melt(solver_input: dict, input_file: str = None):
                             print(f"RL Controller initialized with trained model: target={target_temp}K, base_power={base_power}W")
                         else:
                             print(f"RL Controller initialized (linear): target={target_temp}K, base_power={base_power}W")
+                        
+                        # Flag to print observation on first use
+                        power_controller._print_first_observation = True
                     else:
-                        print("Warning: PowerController (RL) not available. Power control disabled.")
+                        print("Warning: RLController (RL) not available. Power control disabled.")
                 
             except Exception as e:
                 print(f"Warning: Failed to initialize {controller_type.upper()} controller: {e}")
@@ -304,9 +308,14 @@ def go_melt(solver_input: dict, input_file: str = None):
     if not load_chkpt:
         try:
             print("Warming up JAX compilation...")
+            # Ensure moveEverything is available (imported via computeFunctions import *)
+            # Import explicitly to ensure it's in scope
+            from computeFunctions import moveEverything
+            
             # Create dummy inputs for warm-up (use same position to avoid actual movement)
-            warmup_v = jnp.array([laser_start[0], laser_start[1], laser_start[2], 0.0, 0.0, 0.0, Properties["laser_power"]])
-            warmup_move_hist = [jnp.array(0), jnp.array(0), jnp.array(0)]
+            # Use explicit float32 dtype for consistency
+            warmup_v = jnp.array([laser_start[0], laser_start[1], laser_start[2], 0.0, 0.0, 0.0, Properties["laser_power"]], dtype=jnp.float32)
+            warmup_move_hist = [jnp.array(0, dtype=jnp.float32), jnp.array(0, dtype=jnp.float32), jnp.array(0, dtype=jnp.float32)]
             # Warm-up call - this forces JAX to compile without GPU graph capture
             # Use block_until_ready() to ensure compilation happens
             result = moveEverything(
@@ -319,14 +328,20 @@ def go_melt(solver_input: dict, input_file: str = None):
                 L2L3Eratio,
                 Properties["layer_height"],
             )
-            # Force execution to complete
-            _ = [x.block_until_ready() if hasattr(x, 'block_until_ready') else x for x in result]
+            # Force execution to complete - handle tuple result properly
+            if isinstance(result, tuple):
+                _ = [x.block_until_ready() if hasattr(x, 'block_until_ready') else None for x in result if x is not None]
+            else:
+                _ = result.block_until_ready() if hasattr(result, 'block_until_ready') else None
             # Clear cache after warm-up to ensure fresh compilation in main loop
-            moveEverything._clear_cache()
+            if hasattr(moveEverything, '_clear_cache'):
+                moveEverything._clear_cache()
             print("Warm-up complete.")
         except Exception as e:
             print(f"Warning: Warm-up failed: {e}")
             print("This may cause GPU graph capture errors. Continuing anyway...")
+            import traceback
+            traceback.print_exc()
 
     # -------------------------------
     # Start Time Loop
@@ -500,10 +515,17 @@ def go_melt(solver_input: dict, input_file: str = None):
                     if time_inc == 0 or not hasattr(go_melt, '_first_move'):
                         try:
                             from computeFunctions import moveEverything
-                            moveEverything._clear_cache()
+                            if hasattr(moveEverything, '_clear_cache'):
+                                moveEverything._clear_cache()
                             go_melt._first_move = True
                         except:
                             pass
+                    
+                    # Ensure laser_pos is float32 for consistency
+                    if isinstance(laser_pos, jnp.ndarray):
+                        laser_pos = jnp.asarray(laser_pos, dtype=jnp.float32)
+                    elif isinstance(laser_pos, (list, tuple, np.ndarray)):
+                        laser_pos = jnp.array(laser_pos, dtype=jnp.float32)
                     
                     (Levels, Shapes, LInterp, move_hist) = moveEverything(
                         laser_pos,
@@ -557,11 +579,18 @@ def go_melt(solver_input: dict, input_file: str = None):
                     if power_controller is not None:
                         try:
                             # Execute controller step with updated Levels (has current temperature)
-                            new_power, power_updated = power_controller.step(Levels)
+                            new_power, power_updated = power_controller.step(
+                                Levels,
+                                laser_all=laser_all if 'laser_all' in locals() else None,
+                                accum_time=accum_time if 'accum_time' in locals() else None,
+                                accum_idx=Levels[0]["idx"] if 'accum_time' in locals() else None,
+                                Properties=Properties
+                            )
                             
                             if power_updated:
-                                max_temp = power_controller.observation_history[-1]
-                                print(f"  -> Power updated: {new_power:.2f} W (target: {power_controller.target_temperature:.2f} K)")
+                                # Get current temperature from history
+                                max_temp = power_controller.temperature_history[-1] if power_controller.temperature_history else 0.0
+                                print(f"  -> Power updated: {new_power:.2f} W, Temp: {max_temp:.2f} K (target: {power_controller.target_temperature:.2f} K)")
                         except Exception as e:
                             # If controller fails, continue with current power
                             print(f"Warning: Power controller error: {e}. Continuing with current power.")
@@ -694,11 +723,18 @@ def go_melt(solver_input: dict, input_file: str = None):
             if power_controller is not None:
                 try:
                     # Execute controller step with updated Levels
-                    new_power, power_updated = power_controller.step(Levels)
+                    new_power, power_updated = power_controller.step(
+                        Levels,
+                        laser_all=laser_all,
+                        accum_time=accum_time[Levels[0]["idx"]] if 'accum_time' in locals() else None,
+                        accum_idx=Levels[0]["idx"],
+                        Properties=Properties
+                    )
                     
                     if power_updated:
-                        max_temp = power_controller.observation_history[-1]
-                        print(f"  -> Power updated: {new_power:.2f} W (target: {power_controller.target_temperature:.2f} K)")
+                        # Get current temperature from history
+                        max_temp = power_controller.temperature_history[-1] if power_controller.temperature_history else 0.0
+                        print(f"  -> Power updated: {new_power:.2f} W, Temp: {max_temp:.2f} K (target: {power_controller.target_temperature:.2f} K)")
                 except Exception as e:
                     print(f"Warning: Power controller error in subcycling: {e}")
 
@@ -829,14 +865,73 @@ if __name__ == "__main__":
     # -------------------------------
     # Parse Command-Line Arguments
     # -------------------------------
-    # Usage: python3 run_go_melt.py DEVICE_ID input_file
-    DEVICE_ID = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 0
-    input_file = sys.argv[2] if len(sys.argv) > 2 else "examples/example.json"
-
-    if len(sys.argv) <= 1:
-        print("GPU ID not provided. Setting GPU to 0.")
-    if len(sys.argv) <= 2:
-        print("Input file not provided. Using default: 'examples/example.json'.")
+    parser = argparse.ArgumentParser(
+        description="GO-MELT Simulation Runner",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python go_melt.py 0 examples/rl.json
+  python go_melt.py 0 examples/rl.json --checkpoints-dir ./rl_training/checkpoints
+  python go_melt.py 0 examples/rl.json --checkpoints-dir ./rl_training/checkpoints --checkpoint-name best_model
+        """
+    )
+    
+    parser.add_argument(
+        "device_id",
+        type=int,
+        nargs="?",
+        default=0,
+        help="GPU device ID (default: 0)"
+    )
+    
+    parser.add_argument(
+        "input_file",
+        type=str,
+        nargs="?",
+        default="examples/example.json",
+        help="Path to input JSON configuration file (default: examples/example.json)"
+    )
+    
+    parser.add_argument(
+        "--checkpoints-dir",
+        type=str,
+        default=None,
+        help="Directory containing RL model checkpoints (e.g., ./rl_training/checkpoints)"
+    )
+    
+    parser.add_argument(
+        "--checkpoint-name",
+        type=str,
+        default="best_model",
+        help="Name of checkpoint to use (without .zip extension, default: best_model). "
+             "Will look for {name}.zip in checkpoints directory"
+    )
+    
+    args = parser.parse_args()
+    
+    DEVICE_ID = args.device_id
+    input_file = args.input_file
+    
+    # Check for checkpoints folder if specified
+    checkpoints_dir = args.checkpoints_dir
+    checkpoint_name = args.checkpoint_name
+    
+    if checkpoints_dir:
+        checkpoints_path = Path(checkpoints_dir)
+        if not checkpoints_path.exists():
+            print(f"Warning: Checkpoints directory not found: {checkpoints_dir}")
+            print("Continuing without checkpoint override.")
+            checkpoints_dir = None
+        else:
+            # Look for the specified checkpoint
+            checkpoint_file = checkpoints_path / f"{checkpoint_name}.zip"
+            if not checkpoint_file.exists():
+                print(f"Warning: Checkpoint file not found: {checkpoint_file}")
+                print("Available files in checkpoints directory:")
+                for f in checkpoints_path.glob("*.zip"):
+                    print(f"  - {f.name}")
+                print("Continuing without checkpoint override.")
+                checkpoints_dir = None
 
     # -------------------------------
     # Set Environment for JAX
@@ -846,6 +941,7 @@ if __name__ == "__main__":
     
     # Disable GPU graph capture to avoid "Failed to capture gpu graph" errors
     # This is especially important for PID controller which may trigger different code paths
+    # GPU graph capture fails when code paths differ between calls (e.g., with/without controller)
     import jax
     jax.config.update("jax_enable_x64", False)  # Use float32 for better compatibility
     
@@ -856,7 +952,22 @@ if __name__ == "__main__":
     except:
         pass  # Older JAX versions may not have this option
     
-    # Try to disable GPU graph capture more aggressively
+    # Disable GPU graph capture entirely to avoid "Failed to capture gpu graph" errors
+    # This is especially important when using controllers (PID/RL) that may change code paths
+    # Note: We don't set XLA_FLAGS with invalid flags - only use JAX config methods
+    try:
+        # Method 1: Disable via JAX config if available
+        try:
+            jax.config.update("jax_gpu_enable_async_collectives", False)
+        except:
+            pass
+        
+        # Method 2: Try to disable GPU graph capture via environment (if supported)
+        # Only set valid XLA_FLAGS - don't add invalid flags
+        # The XLA_FLAGS environment variable should be set by user if needed
+    except Exception as e:
+        print(f"Warning: Could not fully disable GPU graph capture: {e}")
+    
     # Set environment variable to prevent GPU graph optimization
     if "XLA_PYTHON_CLIENT_ALLOCATOR" not in os.environ:
         os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
@@ -878,10 +989,26 @@ if __name__ == "__main__":
     except FileNotFoundError:
         print(f"Error: Input file '{input_file}' not found.")
         sys.exit(1)
+    
+    # Update checkpoint path if checkpoints directory was specified
+    if checkpoints_dir:
+        checkpoint_file = Path(checkpoints_dir) / f"{checkpoint_name}.zip"
+        if checkpoint_file.exists():
+            # Update the RL model path in the config
+            if "power_controller" in solver_input:
+                controller_type = solver_input["power_controller"].get("type", "").lower()
+                if controller_type == "rl":
+                    if "controller_params" not in solver_input["power_controller"]:
+                        solver_input["power_controller"]["controller_params"] = {}
+                    solver_input["power_controller"]["controller_params"]["rl_model_path"] = str(checkpoint_file.absolute())
+                    print(f"Using checkpoint: {checkpoint_file.absolute()}")
 
     # -------------------------------
     # Launch GO-MELT Simulation
     # -------------------------------
     print("Running GO-MELT")
     print(f"GPU: {DEVICE_ID}, Input File: {input_file}")
+    if checkpoints_dir:
+        print(f"Checkpoints Directory: {checkpoints_dir}")
+        print(f"Checkpoint Name: {checkpoint_name}")
     go_melt(solver_input, input_file)
