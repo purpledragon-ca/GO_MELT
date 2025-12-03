@@ -160,6 +160,13 @@ def create_animation(results_dir, level=3, output_file=None, field='temperature'
             max_temp = np.max(temps)
             avg_temp = np.mean(temps)
             
+            # Try to read power from VTR file
+            current_power = None
+            if 'Laser Power (W)' in grid.point_data:
+                power_data = grid['Laser Power (W)']
+                # Power is constant field, get first value
+                current_power = float(power_data[0]) if len(power_data) > 0 else None
+            
             # Remove previous text if it exists
             if text_actor is not None:
                 plotter.remove_actor(text_actor)
@@ -168,6 +175,9 @@ def create_animation(results_dir, level=3, output_file=None, field='temperature'
             stats_text = (f"Level 3 Statistics:\n"
                          f"Max Temperature: {max_temp:.2f} K\n"
                          f"Avg Temperature: {avg_temp:.2f} K")
+            if current_power is not None:
+                stats_text += f"\nCurrent Power: {current_power:.2f} W"
+            
             text_actor = plotter.add_text(
                 stats_text,
                 position='upper_left',
@@ -376,6 +386,13 @@ def create_overview_animation(results_dir, output_file=None, field='temperature'
             max_temp = np.max(temps)
             avg_temp = np.mean(temps)
             
+            # Try to read power from Level 3 VTR file
+            current_power = None
+            if 'Laser Power (W)' in level3_grid.point_data:
+                power_data = level3_grid['Laser Power (W)']
+                # Power is constant field, get first value
+                current_power = float(power_data[0]) if len(power_data) > 0 else None
+            
             # Remove previous text if it exists
             if text_actor is not None:
                 plotter.remove_actor(text_actor)
@@ -384,6 +401,9 @@ def create_overview_animation(results_dir, output_file=None, field='temperature'
             stats_text = (f"Level 3 Statistics:\n"
                          f"Max Temperature: {max_temp:.2f} K\n"
                          f"Avg Temperature: {avg_temp:.2f} K")
+            if current_power is not None:
+                stats_text += f"\nCurrent Power: {current_power:.2f} W"
+            
             text_actor = plotter.add_text(
                 stats_text,
                 position='upper_left',

@@ -12,6 +12,20 @@ from createPath import parsingGcode, count_lines
 import gc
 import json
 
+# Import RL controller for power control
+# Ensure current directory is in path for imports
+_current_dir = os.path.dirname(os.path.abspath(__file__))
+if _current_dir not in sys.path:
+    sys.path.insert(0, _current_dir)
+
+try:
+    from rl_controller import PowerController
+    HAS_RL_CONTROLLER = True
+except ImportError as e:
+    HAS_RL_CONTROLLER = False
+    PowerController = None
+    print(f"Warning: RL controller not found ({str(e)}). Power control disabled.")
+
 
 def go_melt(solver_input: dict):
     """
@@ -76,12 +90,44 @@ def go_melt(solver_input: dict):
     LInterp = [L1L2Interp, L2L3Interp]
 
     # -------------------------------
+    # Initialize RL Power Controller (before other initialization)
+    # -------------------------------
+    power_controller = None
+    if HAS_RL_CONTROLLER and PowerController is not None:
+        # Get controller parameters from solver_input (optional)
+        rl_config = solver_input.get("rl_controller", {})
+        target_temp = rl_config.get("target_temperature", 3000.0)
+        base_power = Properties["laser_power"]
+        update_interval = rl_config.get("update_interval", 10)  # Every 10 steps (0.1m)
+        controller_params = rl_config.get("controller_params", {
+            "kp": 0.1,
+            "power_min": 0.0,
+            "power_max": 500.0
+        })
+        
+        try:
+            power_controller = PowerController(
+                target_temperature=target_temp,
+                base_power=base_power,
+                update_interval=update_interval,
+                controller_params=controller_params
+            )
+            print(f"RL Controller: target={target_temp}K, base_power={base_power}W")
+        except Exception as e:
+            print(f"Warning: Failed to initialize RL controller: {e}")
+            power_controller = None
+
+    # -------------------------------
     # Time & Output Initialization
     # -------------------------------
     time_inc = record_inc = wait_inc = 0
     t_output = 0.0
     savenum = int(time_inc / Nonmesh["record_step"]) + 1
-    saveResults(Levels, Nonmesh, savenum)
+    # Get initial power for saving
+    initial_power = Properties["laser_power"]
+    if power_controller is not None:
+        initial_power = power_controller.get_current_power()
+    saveResults(Levels, Nonmesh, savenum, power=initial_power)
 
     # -------------------------------
     # Layer Tracking & Accumulation
@@ -113,7 +159,8 @@ def go_melt(solver_input: dict):
     # Load Checkpoint if Requested
     # -------------------------------
     if Nonmesh["layer_num"] > 0:
-        print(f"Checkpoint loading for start of Layer {Nonmesh['layer_num']}")
+        # Loading checkpoint for Layer {Nonmesh['layer_num']}
+        print(f"Loading checkpoint: Layer {Nonmesh['layer_num']}")
         FILENAME = f"Checkpoint{str(Nonmesh['layer_num']).zfill(4)}.pkl"
 
         with open(np_path.joinpath(FILENAME), "rb") as f:
@@ -187,10 +234,9 @@ def go_melt(solver_input: dict):
                         subcycleGOMELT._clear_cache()
                         moveEverything._clear_cache()
                         gc.collect()
-                        print("Cleared cache")
+                        # Cache cleared
                     except:
                         gc.collect()
-                        print("Cleared some cache")
 
                 # -----------------------------------
                 # Handle Layer Change
@@ -311,13 +357,22 @@ def go_melt(solver_input: dict):
                         move_vert = False
                         substrate = getSubstrateNodes(Levels)
                         Levels[0]["S1"] = Levels[0]["S1"].at[: substrate[0]].set(1)
-                        print("Start of new layer")
+                        # New layer started
+
+                # -----------------------------------
+                # RL Power Control (get controlled power for current step)
+                # -----------------------------------
+                # Determine power to use: controlled power if available, otherwise toolpath power
+                current_power = float(laser_pos[6])  # Default: power from toolpath
+                if power_controller is not None and wait_inc <= Nonmesh["wait_time"]:
+                    current_power = power_controller.get_current_power()
 
                 # -----------------------------------
                 # Solve Thermal Fields
                 # -----------------------------------
                 if wait_inc <= Nonmesh["wait_time"]:
                     # Full GO-MELT step (Levels 1–3)
+                    # Use controlled power if available, otherwise use toolpath power
                     Levels, all_reset = stepGOMELT(
                         Levels,
                         ne_nn,
@@ -327,13 +382,26 @@ def go_melt(solver_input: dict):
                         laser_pos,
                         Properties,
                         laser_pos[5],  # Time step size
-                        laser_pos[6],  # Power
+                        current_power,  # Use controlled power
                         substrate,
                     )
 
-                    if Nonmesh["info_T"]:
-                        print(f"Step {time_inc + 1} / {total_t_inc}")
-                        printLevelMaxMin(Levels, level_names)
+                    # Temperature/power/location already printed in main loop
+
+                    # -----------------------------------
+                    # RL Power Control (after thermal solve - update for next steps)
+                    # -----------------------------------
+                    if power_controller is not None:
+                        try:
+                            # Execute controller step with updated Levels (has current temperature)
+                            new_power, power_updated = power_controller.step(Levels)
+                            
+                            if power_updated:
+                                max_temp = power_controller.observation_history[-1]
+                                print(f"  -> Power updated: {new_power:.2f} W (target: {power_controller.target_temperature:.2f} K)")
+                        except Exception as e:
+                            # If controller fails, continue with current power
+                            print(f"Warning: RL controller error: {e}. Continuing with current power.")
 
                     # Update accumulated melt time
                     if record_accum:
@@ -376,7 +444,7 @@ def go_melt(solver_input: dict):
                         substrate,
                     )
                     _dwell_time_count += laser_pos[5]
-                    print(f"Dwell Time {_dwell_time_count:.6f} s")
+                    # Dwell time: {_dwell_time_count:.6f} s
 
                 # -----------------------------------
                 # Increment Time and Record Counters
@@ -389,8 +457,7 @@ def go_melt(solver_input: dict):
             # -----------------------------------
             if new_checkpoint:
                 Nonmesh["layer_num"] += 1
-                print(f"Saving checkpoint for Layer {Nonmesh['layer_num']}")
-
+                # Saving checkpoint for Layer {Nonmesh['layer_num']}
                 FILENAME = f"Checkpoint{str(Nonmesh['layer_num']).zfill(4)}.pkl"
                 if not os.path.exists(np_path):
                     os.makedirs(np_path)
@@ -399,7 +466,7 @@ def go_melt(solver_input: dict):
                     [Levels, accum_time, max_accum_time, time_inc, record_inc],
                     Path(np_path).joinpath(FILENAME),
                 )
-                print("Saved Checkpoint")
+                # Checkpoint saved
 
                 # End simulation if final layer reached
                 if Nonmesh["layer_num"] == layer_check:
@@ -432,6 +499,12 @@ def go_melt(solver_input: dict):
 
             # Extract power values for each substep
             _P = laser_all[:, 6]
+            
+            # RL Power Control: Update power array for subcycling if controller is active
+            if power_controller is not None:
+                current_power = power_controller.get_current_power()
+                # Override all powers in this subcycle with controlled power
+                _P = jnp.array([float(current_power)] * len(_P))
 
             # Run full GO-MELT subcycling
             Levels, L2all, L3all, L3pall, _max_accum, _accum = subcycleGOMELT(
@@ -454,6 +527,18 @@ def go_melt(solver_input: dict):
                 max_accum_time = max_accum_time.at[Levels[0]["idx"]].set(_max_accum)
                 accum_time = accum_time.at[Levels[0]["idx"]].set(_accum)
 
+            # RL Power Control: Update power after subcycling (for next cycle)
+            if power_controller is not None:
+                try:
+                    # Execute controller step with updated Levels
+                    new_power, power_updated = power_controller.step(Levels)
+                    
+                    if power_updated:
+                        max_temp = power_controller.observation_history[-1]
+                        print(f"  -> Power updated: {new_power:.2f} W (target: {power_controller.target_temperature:.2f} K)")
+                except Exception as e:
+                    print(f"Warning: RL controller error in subcycling: {e}")
+
             # Update counters and total elapsed time
             time_inc += t_add
             record_inc += t_add
@@ -467,30 +552,37 @@ def go_melt(solver_input: dict):
         if record_inc >= Nonmesh["record_step"]:
             record_inc = 0
             savenum = int(time_inc / Nonmesh["record_step"]) + 1
-            saveResults(Levels, Nonmesh, savenum)
+            # Get current power for saving
+            current_power_for_save = Properties["laser_power"]
+            if power_controller is not None:
+                current_power_for_save = power_controller.get_current_power()
+            elif single_step and len(laser_all) > 0:
+                # Use power from last laser position in single-step mode
+                current_power_for_save = float(laser_all[-1, 6])
+            elif not single_step and len(laser_all) > 0:
+                # Use power from last laser position in subcycling mode
+                current_power_for_save = float(laser_all[-1, 6])
+            saveResults(Levels, Nonmesh, savenum, power=current_power_for_save)
 
-        # Print temperature info if enabled
-        if Nonmesh["info_T"]:
-            printLevelMaxMin(Levels, level_names)
-
-        # Timing diagnostics
-        tend = time.time()
-        t_duration = tend - tstart
-        t_now = 1000 * (tend - t_loop)
-        t_avg = 1000 * t_duration / time_inc
-        execution_time_rem = (
-            ((tend - t_loop) / subcycle[2]) * (total_t_inc - time_inc) / 3600
-        )
-
-        print(
-            "%d/%d, Real: %.6f s, Wall: %.2f s, Loop: %5.2f ms, Avg: %5.2f ms/dt"
-            % (time_inc, total_t_inc, t_output, t_duration, t_now, t_avg)
-        )
-        print(
-            "Laser location: X: %.2f, Y: %.2f, Z: %.2f"
-            % (laser_all[-1, 0], laser_all[-1, 1], laser_all[-1, 2])
-        )
-        print(f"Estimated execution time remaining: {execution_time_rem:.4f} hours")
+        # Simple printing: Focus on temps, power, location
+        # Get current temperature (max from Level 3)
+        max_temp_L3 = float(jnp.max(Levels[3]["T0"]))
+        
+        # Get current power
+        current_power_display = Properties["laser_power"]
+        if power_controller is not None:
+            current_power_display = power_controller.get_current_power()
+        elif len(laser_all) > 0:
+            current_power_display = float(laser_all[-1, 6])
+        
+        # Get current location
+        current_loc = laser_all[-1, :] if len(laser_all) > 0 else jnp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, current_power_display])
+        
+        # Simple print format: Step | Max Temp | Power | Location
+        print(f"Step {time_inc:6d}/{total_t_inc} | "
+              f"Max Temp: {max_temp_L3:7.2f} K | "
+              f"Power: {current_power_display:6.2f} W | "
+              f"Location: X:{current_loc[0]:6.2f} Y:{current_loc[1]:6.2f} Z:{current_loc[2]:6.2f}")
 
     # -----------------------------------
     # Finalization
@@ -499,7 +591,11 @@ def go_melt(solver_input: dict):
 
     # Save final Level 0 state and temperature fields
     saveState(Levels[0], "Level0_", Nonmesh["layer_num"], Nonmesh["save_path"], 0)
-    saveResultsFinal(Levels, Nonmesh)
+    # Get final power for saving
+    final_power = Properties["laser_power"]
+    if power_controller is not None:
+        final_power = power_controller.get_current_power()
+    saveResultsFinal(Levels, Nonmesh, power=final_power)
 
     jnp.savez(
         f"{Nonmesh['save_path']}FinalTemperatureFields",
@@ -522,12 +618,11 @@ def go_melt(solver_input: dict):
         subcycleGOMELT._clear_cache()
         moveEverything._clear_cache()
         gc.collect()
-        print("Cleared cache")
+        # Cache cleared
     except:
         gc.collect()
-        print("Cleared some cache")
 
-    print("End of simulation")
+    print("\nSimulation completed.")
 
 
 if __name__ == "__main__":

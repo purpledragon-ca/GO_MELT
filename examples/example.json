@@ -121,7 +121,7 @@
         "Level1_record_step": 1,
         "laser_velocity": 1000,
         "save_path": "./results/example/",
-        "gcode": "./examples/gcodefiles/example_with_power.gcode",
+        "gcode": "./examples/gcodefiles/example.gcode",
         "toolpath": "./results/example/toolpath.txt",
         "layer_num": 0,
         "subcycle_num_L2": 5,
@@ -129,6 +129,15 @@
         "info_T": 1,
         "dwell_time_multiplier": 8,
         "use_txt": 0
+    },
+    "rl_controller": {
+        "target_temperature": 3000.0,
+        "update_interval": 10,
+        "controller_params": {
+            "kp": 0.1,
+            "power_min": 0.0,
+            "power_max": 500.0
+        }
     }
 }
 

@@ -1946,7 +1946,7 @@ def calc_length_h(A):
     return [Lx, Ly, Lz], [hx, hy, hz]
 
 
-def saveResult(Level, save_str, record_lab, save_path, zoffset):
+def saveResult(Level, save_str, record_lab, save_path, zoffset, power=None):
     """
     Save the temperature and state fields of a mesh level to a VTK file.
 
@@ -1963,6 +1963,7 @@ def saveResult(Level, save_str, record_lab, save_path, zoffset):
     record_lab (int): Frame or timestep label for file naming.
     save_path (str): Directory path to save the output file.
     zoffset (float): Offset applied to z-coordinates for rendering purposes.
+    power (float, optional): Current laser power (W) to save as metadata.
 
     Returns:
     None
@@ -1980,13 +1981,21 @@ def saveResult(Level, save_str, record_lab, save_path, zoffset):
         Level["S1"].reshape(Level["nodes"][2], Level["nodes"][1], Level["nodes"][0])
     ).transpose((2, 1, 0))
 
-    # Save a VTK rectilinear grid file
+    # Prepare point data dictionary
     pointData = {"Temperature (K)": vtkT, "State (Powder/Solid)": vtkS}
+    
+    # Add power as a constant scalar field if provided
+    if power is not None:
+        # Create a constant field with power value at all points
+        power_field = np.full_like(vtkT, float(power))
+        pointData["Laser Power (W)"] = power_field
+    
+    # Save a VTK rectilinear grid file
     vtkSave = f"{save_path}{save_str}{record_lab:08}"
     gridToVTK(vtkSave, vtkcx, vtkcy, vtkcz, pointData=pointData)
 
 
-def saveFinalResult(Level, save_str, save_path, zoffset):
+def saveFinalResult(Level, save_str, save_path, zoffset, power=None):
     """
     Save the final temperature and state fields of a mesh level to a VTK file.
 
@@ -2002,6 +2011,7 @@ def saveFinalResult(Level, save_str, save_path, zoffset):
     save_str (str): Prefix for the output filename.
     save_path (str): Directory path to save the output file.
     zoffset (float): Offset applied to z-coordinates for rendering purposes.
+    power (float, optional): Current laser power (W) to save as metadata.
 
     Returns:
     None
@@ -2019,8 +2029,16 @@ def saveFinalResult(Level, save_str, save_path, zoffset):
         Level["S1"].reshape(Level["nodes"][2], Level["nodes"][1], Level["nodes"][0])
     ).transpose((2, 1, 0))
 
-    # Save a VTK rectilinear grid file
+    # Prepare point data dictionary
     pointData = {"Temperature (K)": vtkT, "State (Powder/Solid)": vtkS}
+    
+    # Add power as a constant scalar field if provided
+    if power is not None:
+        # Create a constant field with power value at all points
+        power_field = np.full_like(vtkT, float(power))
+        pointData["Laser Power (W)"] = power_field
+    
+    # Save a VTK rectilinear grid file
     vtkSave = f"{save_path}{save_str}Final"
     gridToVTK(vtkSave, vtkcx, vtkcy, vtkcz, pointData=pointData)
 
@@ -3669,31 +3687,50 @@ def printLevelMaxMin(Ls, Lnames):
     print("")
 
 
-def saveResults(Levels, Nonmesh, savenum):
+def saveResults(Levels, Nonmesh, savenum, power=None):
     """
     Save temperature results for Levels 1-3 based on save frequency and flags.
+    
+    Parameters:
+    -----------
+    Levels : dict
+        Dictionary containing all level data
+    Nonmesh : dict
+        Non-mesh simulation parameters
+    savenum : int
+        Save number/frame label
+    power : float, optional
+        Current laser power (W) to save with results
     """
     if Nonmesh["output_files"] == 1:
         if savenum == 1 or (
             np.mod(savenum, Nonmesh["Level1_record_step"]) == 1
             or Nonmesh["Level1_record_step"] == 1
         ):
-            saveResult(Levels[1], "Level1_", savenum, Nonmesh["save_path"], 2e-3)
+            saveResult(Levels[1], "Level1_", savenum, Nonmesh["save_path"], 2e-3, power)
             # saveState(Levels[0], "Level0_", savenum, Nonmesh["save_path"], 0)
 
-        saveResult(Levels[2], "Level2_", savenum, Nonmesh["save_path"], 1e-3)
-        saveResult(Levels[3], "Level3_", savenum, Nonmesh["save_path"], 0)
-        print(f"Saved Levels_{savenum:08}")
+        saveResult(Levels[2], "Level2_", savenum, Nonmesh["save_path"], 1e-3, power)
+        saveResult(Levels[3], "Level3_", savenum, Nonmesh["save_path"], 0, power)
 
 
-def saveResultsFinal(Levels, Nonmesh):
+def saveResultsFinal(Levels, Nonmesh, power=None):
     """
     Save final temperature results for Levels 1-3.
+    
+    Parameters:
+    -----------
+    Levels : dict
+        Dictionary containing all level data
+    Nonmesh : dict
+        Non-mesh simulation parameters
+    power : float, optional
+        Current laser power (W) to save with results
     """
     if Nonmesh["output_files"] == 1:
-        saveFinalResult(Levels[1], "Level1_", Nonmesh["save_path"], 2e-3)
-        saveFinalResult(Levels[2], "Level2_", Nonmesh["save_path"], 1e-3)
-        saveFinalResult(Levels[3], "Level3_", Nonmesh["save_path"], 0)
+        saveFinalResult(Levels[1], "Level1_", Nonmesh["save_path"], 2e-3, power)
+        saveFinalResult(Levels[2], "Level2_", Nonmesh["save_path"], 1e-3, power)
+        saveFinalResult(Levels[3], "Level3_", Nonmesh["save_path"], 0, power)
         print("Saved Final Results")
 
 
