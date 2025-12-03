@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import dill
@@ -12,28 +13,39 @@ from createPath import parsingGcode, count_lines
 import gc
 import json
 
-# Import RL controller for power control
+# Import controllers for power control
 # Ensure current directory is in path for imports
 _current_dir = os.path.dirname(os.path.abspath(__file__))
 if _current_dir not in sys.path:
     sys.path.insert(0, _current_dir)
 
 try:
-    from rl_controller import PowerController
-    HAS_RL_CONTROLLER = True
+    from rl_controller import PowerController, PIDController
+    HAS_CONTROLLERS = True
 except ImportError as e:
-    HAS_RL_CONTROLLER = False
+    HAS_CONTROLLERS = False
     PowerController = None
-    print(f"Warning: RL controller not found ({str(e)}). Power control disabled.")
+    PIDController = None
+    print(f"Warning: Controllers not found ({str(e)}). Power control disabled.")
 
 
-def go_melt(solver_input: dict):
+def go_melt(solver_input: dict, input_file: str = None):
     """
     Main GO-MELT simulation driver. This function initializes the simulation,
     sets up all levels, properties, and toolpath data, and prepares for time stepping.
     Thermal solves using the GO-MELT algorithm are then used.
+    
+    Parameters:
+    -----------
+    solver_input : dict
+        Dictionary containing all simulation configuration
+    input_file : str, optional
+        Path to the input JSON file (used for naming output directory)
     """
     tstart = time.time()  # Start timer
+    
+    # Initialize flag for first moveEverything call
+    go_melt._first_move = False
 
     level_names = ["L1", "L2", "L3"]
 
@@ -60,6 +72,135 @@ def go_melt(solver_input: dict):
     L2L3Eratio = [
         int(jnp.round(Levels[2]["h"][i] / Levels[3]["h"][i])) for i in range(3)
     ]
+
+    # -------------------------------
+    # Initialize Power Controller (PID or RL) - before other initialization
+    # -------------------------------
+    power_controller = None
+    controller_type = None
+    
+    if HAS_CONTROLLERS:
+        # Get controller configuration from solver_input
+        controller_config = solver_input.get("power_controller", {})
+        controller_type = controller_config.get("type", "none").lower()  # "pid", "rl", or "none"
+        
+        if controller_type in ["pid", "rl"]:
+            # Common parameters
+            target_temp = controller_config.get("target_temperature", 3000.0)
+            base_power = Properties["laser_power"]
+            update_interval = controller_config.get("update_interval", 10)  # Every 10 steps (0.1m)
+            controller_params = controller_config.get("controller_params", {})
+            
+            try:
+                if controller_type == "pid":
+                    # Initialize PID controller
+                    if PIDController is not None:
+                        # Set default PID parameters if not provided
+                        if "kp" not in controller_params:
+                            controller_params["kp"] = 0.1
+                        if "ki" not in controller_params:
+                            controller_params["ki"] = 0.01
+                        if "kd" not in controller_params:
+                            controller_params["kd"] = 0.0
+                        if "power_min" not in controller_params:
+                            controller_params["power_min"] = 0.0
+                        if "power_max" not in controller_params:
+                            controller_params["power_max"] = 500.0
+                        
+                        power_controller = PIDController(
+                            target_temperature=target_temp,
+                            base_power=base_power,
+                            update_interval=update_interval,
+                            controller_params=controller_params
+                        )
+                        print(f"PID Controller initialized: target={target_temp}K, base_power={base_power}W")
+                        print(f"  PID gains: kp={controller_params['kp']}, ki={controller_params['ki']}, kd={controller_params['kd']}")
+                    else:
+                        print("Warning: PIDController not available. Power control disabled.")
+                
+                elif controller_type == "rl":
+                    # Initialize RL controller
+                    if PowerController is not None:
+                        # Set default RL parameters if not provided
+                        if "kp" not in controller_params:
+                            controller_params["kp"] = 0.1
+                        if "power_min" not in controller_params:
+                            controller_params["power_min"] = 0.0
+                        if "power_max" not in controller_params:
+                            controller_params["power_max"] = 500.0
+                        
+                        # Check for RL model path
+                        rl_model_path = controller_params.get("rl_model_path", None)
+                        
+                        power_controller = PowerController(
+                            target_temperature=target_temp,
+                            base_power=base_power,
+                            update_interval=update_interval,
+                            controller_params=controller_params,
+                            rl_model_path=rl_model_path
+                        )
+                        if rl_model_path and power_controller.use_rl:
+                            print(f"RL Controller initialized with trained model: target={target_temp}K, base_power={base_power}W")
+                        else:
+                            print(f"RL Controller initialized (linear): target={target_temp}K, base_power={base_power}W")
+                    else:
+                        print("Warning: PowerController (RL) not available. Power control disabled.")
+                
+            except Exception as e:
+                print(f"Warning: Failed to initialize {controller_type.upper()} controller: {e}")
+                power_controller = None
+        else:
+            # No controller or invalid type
+            if controller_type != "none":
+                print(f"Warning: Unknown controller type '{controller_type}'. Valid options: 'pid', 'rl', 'none'")
+            print("Running without power controller (using toolpath power).")
+
+    # -------------------------------
+    # Update Save Path with Timestamp and Controller Type/JSON Name
+    # -------------------------------
+    # Generate timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Extract JSON name from input file (without extension)
+    if input_file:
+        json_name = Path(input_file).stem  # Get filename without extension
+    else:
+        # Fallback: use controller type or "none"
+        json_name = controller_type if controller_type else "none"
+    
+    # Get base save path from Nonmesh
+    base_save_path = Nonmesh.get("save_path", "./results/")
+    
+    # Create new save path: base_path/timestamp_jsonname/
+    # If save_path is "./results/example/", we want "./results/timestamp_jsonname/"
+    base_path = Path(base_save_path.rstrip("/")).parent
+    new_save_path = base_path / f"{timestamp}_{json_name}"
+    
+    # Ensure directory exists
+    new_save_path.mkdir(parents=True, exist_ok=True)
+    new_save_path_str = str(new_save_path) + "/"
+    
+    # Update Nonmesh save_path
+    Nonmesh["save_path"] = new_save_path_str
+    
+    # Update toolpath path to be in the new save directory
+    original_toolpath = Nonmesh.get("toolpath", "./results/example/toolpath.txt")
+    toolpath_filename = Path(original_toolpath).name
+    new_toolpath = new_save_path / toolpath_filename
+    
+    # If using existing txt file, copy it to new location
+    if Nonmesh.get("use_txt", 0):
+        original_toolpath_path = Path(original_toolpath)
+        if original_toolpath_path.exists():
+            import shutil
+            shutil.copy2(original_toolpath_path, new_toolpath)
+            print(f"Copied toolpath file to: {new_toolpath}")
+        else:
+            print(f"Warning: Toolpath file not found at {original_toolpath}")
+    
+    Nonmesh["toolpath"] = str(new_toolpath)
+    
+    print(f"Results will be saved to: {new_save_path_str}")
 
     # -------------------------------
     # Toolpath Parsing
@@ -90,34 +231,6 @@ def go_melt(solver_input: dict):
     LInterp = [L1L2Interp, L2L3Interp]
 
     # -------------------------------
-    # Initialize RL Power Controller (before other initialization)
-    # -------------------------------
-    power_controller = None
-    if HAS_RL_CONTROLLER and PowerController is not None:
-        # Get controller parameters from solver_input (optional)
-        rl_config = solver_input.get("rl_controller", {})
-        target_temp = rl_config.get("target_temperature", 3000.0)
-        base_power = Properties["laser_power"]
-        update_interval = rl_config.get("update_interval", 10)  # Every 10 steps (0.1m)
-        controller_params = rl_config.get("controller_params", {
-            "kp": 0.1,
-            "power_min": 0.0,
-            "power_max": 500.0
-        })
-        
-        try:
-            power_controller = PowerController(
-                target_temperature=target_temp,
-                base_power=base_power,
-                update_interval=update_interval,
-                controller_params=controller_params
-            )
-            print(f"RL Controller: target={target_temp}K, base_power={base_power}W")
-        except Exception as e:
-            print(f"Warning: Failed to initialize RL controller: {e}")
-            power_controller = None
-
-    # -------------------------------
     # Time & Output Initialization
     # -------------------------------
     time_inc = record_inc = wait_inc = 0
@@ -128,6 +241,14 @@ def go_melt(solver_input: dict):
     if power_controller is not None:
         initial_power = power_controller.get_current_power()
     saveResults(Levels, Nonmesh, savenum, power=initial_power)
+    
+    # -------------------------------
+    # Error Tracking for MSE Calculation
+    # -------------------------------
+    temperature_errors = []  # Store squared errors: (target_temp - max_temp)^2
+    target_temperature = None
+    if power_controller is not None:
+        target_temperature = power_controller.target_temperature
 
     # -------------------------------
     # Layer Tracking & Accumulation
@@ -174,6 +295,38 @@ def go_melt(solver_input: dict):
         time_inc += time_inc_loaded
     else:
         load_chkpt = False
+
+    # -------------------------------
+    # Warm-up moveEverything to avoid GPU graph capture errors
+    # -------------------------------
+    # Force JAX to compile moveEverything before the main loop
+    # This prevents "Failed to capture gpu graph" errors, especially with PID controller
+    if not load_chkpt:
+        try:
+            print("Warming up JAX compilation...")
+            # Create dummy inputs for warm-up (use same position to avoid actual movement)
+            warmup_v = jnp.array([laser_start[0], laser_start[1], laser_start[2], 0.0, 0.0, 0.0, Properties["laser_power"]])
+            warmup_move_hist = [jnp.array(0), jnp.array(0), jnp.array(0)]
+            # Warm-up call - this forces JAX to compile without GPU graph capture
+            # Use block_until_ready() to ensure compilation happens
+            result = moveEverything(
+                warmup_v,
+                laser_start,
+                Levels,
+                warmup_move_hist,
+                LInterp,
+                L1L2Eratio,
+                L2L3Eratio,
+                Properties["layer_height"],
+            )
+            # Force execution to complete
+            _ = [x.block_until_ready() if hasattr(x, 'block_until_ready') else x for x in result]
+            # Clear cache after warm-up to ensure fresh compilation in main loop
+            moveEverything._clear_cache()
+            print("Warm-up complete.")
+        except Exception as e:
+            print(f"Warning: Warm-up failed: {e}")
+            print("This may cause GPU graph capture errors. Continuing anyway...")
 
     # -------------------------------
     # Start Time Loop
@@ -342,6 +495,16 @@ def go_melt(solver_input: dict):
                 # -----------------------------------
                 if force_move:
                     force_move = False
+                    # Clear cache before first moveEverything call to avoid GPU graph capture issues
+                    # This is especially important for PID controller which may trigger different code paths
+                    if time_inc == 0 or not hasattr(go_melt, '_first_move'):
+                        try:
+                            from computeFunctions import moveEverything
+                            moveEverything._clear_cache()
+                            go_melt._first_move = True
+                        except:
+                            pass
+                    
                     (Levels, Shapes, LInterp, move_hist) = moveEverything(
                         laser_pos,
                         laser_start,
@@ -401,7 +564,7 @@ def go_melt(solver_input: dict):
                                 print(f"  -> Power updated: {new_power:.2f} W (target: {power_controller.target_temperature:.2f} K)")
                         except Exception as e:
                             # If controller fails, continue with current power
-                            print(f"Warning: RL controller error: {e}. Continuing with current power.")
+                            print(f"Warning: Power controller error: {e}. Continuing with current power.")
 
                     # Update accumulated melt time
                     if record_accum:
@@ -537,7 +700,7 @@ def go_melt(solver_input: dict):
                         max_temp = power_controller.observation_history[-1]
                         print(f"  -> Power updated: {new_power:.2f} W (target: {power_controller.target_temperature:.2f} K)")
                 except Exception as e:
-                    print(f"Warning: RL controller error in subcycling: {e}")
+                    print(f"Warning: Power controller error in subcycling: {e}")
 
             # Update counters and total elapsed time
             time_inc += t_add
@@ -567,6 +730,11 @@ def go_melt(solver_input: dict):
         # Simple printing: Focus on temps, power, location
         # Get current temperature (max from Level 3)
         max_temp_L3 = float(jnp.max(Levels[3]["T0"]))
+        
+        # Track temperature error for MSE calculation
+        if target_temperature is not None:
+            error = target_temperature - max_temp_L3
+            temperature_errors.append(error * error)  # Store squared error
         
         # Get current power
         current_power_display = Properties["laser_power"]
@@ -611,6 +779,35 @@ def go_melt(solver_input: dict):
             accum_time=accum_time,
         )
 
+    # -------------------------------
+    # Calculate and Print Mean Squared Error (MSE)
+    # -------------------------------
+    if target_temperature is not None and len(temperature_errors) > 0:
+        mse = np.mean(temperature_errors)
+        rmse = np.sqrt(mse)
+        print(f"\n{'='*60}")
+        print(f"Temperature Control Statistics:")
+        print(f"  Target Temperature: {target_temperature:.2f} K")
+        print(f"  Mean Squared Error (MSE): {mse:.2f} K²")
+        print(f"  Root Mean Squared Error (RMSE): {rmse:.2f} K")
+        print(f"  Number of samples: {len(temperature_errors)}")
+        print(f"{'='*60}\n")
+        
+        # Save MSE to JSON file for animation script
+        mse_data = {
+            "target_temperature": float(target_temperature),
+            "mse": float(mse),
+            "rmse": float(rmse),
+            "num_samples": len(temperature_errors),
+            "controller_type": controller_type if controller_type else "none"
+        }
+        mse_file = Path(Nonmesh["save_path"]) / "mse_stats.json"
+        with open(mse_file, "w") as f:
+            json.dump(mse_data, f, indent=2)
+        print(f"MSE statistics saved to: {mse_file}")
+    else:
+        print("\nNo temperature control active - MSE not calculated.\n")
+
     # Clear JAX caches
     try:
         stepGOMELT._clear_cache()
@@ -646,14 +843,29 @@ if __name__ == "__main__":
     # -------------------------------
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+    
+    # Disable GPU graph capture to avoid "Failed to capture gpu graph" errors
+    # This is especially important for PID controller which may trigger different code paths
+    import jax
+    jax.config.update("jax_enable_x64", False)  # Use float32 for better compatibility
+    
+    # Disable GPU graph optimization which can cause capture errors
+    # Note: Some JAX versions may not support all these options
+    try:
+        jax.config.update("jax_gpu_enable_async_collectives", False)
+    except:
+        pass  # Older JAX versions may not have this option
+    
+    # Try to disable GPU graph capture more aggressively
+    # Set environment variable to prevent GPU graph optimization
+    if "XLA_PYTHON_CLIENT_ALLOCATOR" not in os.environ:
+        os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 
     try:
         # Attempt to assign GPU
         os.environ["CUDA_VISIBLE_DEVICES"] = str(DEVICE_ID)
     except:
         # Fallback to CPU if GPU assignment fails
-        import jax
-
         jax.config.update("jax_platform_name", "cpu")
         print("No GPU found. Running on CPU.")
 
@@ -672,4 +884,4 @@ if __name__ == "__main__":
     # -------------------------------
     print("Running GO-MELT")
     print(f"GPU: {DEVICE_ID}, Input File: {input_file}")
-    go_melt(solver_input)
+    go_melt(solver_input, input_file)

@@ -129,6 +129,18 @@
         "info_T": 1,
         "dwell_time_multiplier": 8,
         "use_txt": 0
+    },
+    "power_controller": {
+        "type": "pid",
+        "target_temperature": 3000.0,
+        "update_interval": 10,
+        "controller_params": {
+            "kp": 0.1,
+            "ki": 0.01,
+            "kd": 0.0,
+            "power_min": 0.0,
+            "power_max": 500.0
+        }
     }
 }
 

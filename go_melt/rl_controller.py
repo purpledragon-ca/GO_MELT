@@ -1,10 +1,11 @@
 """
-RL Controller Module for GO-MELT Power Control
+Power Controller Module for GO-MELT Power Control
 
-This module provides functions for reinforcement learning-based power control.
-Currently implements a simple linear controller as a placeholder for future RL agent.
+This module provides controllers for power control:
+- PID Controller: Proportional-Integral-Derivative controller
+- RL Controller: Reinforcement learning-based controller (currently uses linear controller as placeholder)
 
-The controller adjusts laser power at regular intervals (every 10 steps = 0.1m)
+The controllers adjust laser power at regular intervals (every 10 steps = 0.1m)
 based on the maximum temperature observed in Level 3, with the goal of maintaining
 the maximum temperature around a target value (max 3000K).
 """
@@ -12,13 +13,14 @@ the maximum temperature around a target value (max 3000K).
 import jax.numpy as jnp
 import numpy as np
 from typing import Dict, Tuple, Optional, Union, List
+import os
 
 
-def get_max_temperature_level3(Levels) -> float:
+def get_max_temperature_level3(Levels: Union[List, Dict]) -> float:
     """
     Extract the maximum temperature from Level 3 temperature field.
     
-    This serves as the observation for the RL controller.
+    This serves as the observation for the controllers.
     
     Parameters:
     -----------
@@ -193,7 +195,7 @@ def compute_power_action(
 
 def get_observation(Levels: Union[List, Dict]) -> float:
     """
-    Get observation for RL controller (max temperature in Level 3).
+    Get observation for controllers (max temperature in Level 3).
     
     This is a convenience wrapper around get_max_temperature_level3()
     to match RL terminology.
@@ -211,11 +213,12 @@ def get_observation(Levels: Union[List, Dict]) -> float:
     return get_max_temperature_level3(Levels)
 
 
-class PowerController:
+class PIDController:
     """
-    Power Controller class for managing power updates during simulation.
+    PID (Proportional-Integral-Derivative) Controller for power control.
     
-    This class tracks step count and manages power adjustments at regular intervals.
+    This class implements a PID controller to maintain target temperature
+    by adjusting laser power based on temperature error.
     """
     
     def __init__(
@@ -226,7 +229,7 @@ class PowerController:
         controller_params: Optional[Dict] = None
     ):
         """
-        Initialize the power controller.
+        Initialize the PID controller.
         
         Parameters:
         -----------
@@ -237,19 +240,81 @@ class PowerController:
         update_interval : int
             Number of steps between power updates. Default: 10 (0.1m)
         controller_params : dict, optional
-            Controller parameters (kp, power_min, power_max). Default: None
+            Controller parameters. Default: None
+            Required keys:
+                - kp: Proportional gain (W/K). Default: 0.1
+                - ki: Integral gain (W/(K·s)). Default: 0.01
+                - kd: Derivative gain (W·s/K). Default: 0.0
+                - power_min: Minimum allowed power (W). Default: 0.0
+                - power_max: Maximum allowed power (W). Default: 500.0
+                - integral_limit: Maximum integral term (W). Default: 100.0
         """
         self.target_temperature = target_temperature
         self.current_power = base_power
         self.base_power = base_power
         self.update_interval = update_interval
         self.step_count = 0
-        self.controller_params = controller_params or {}
         
-        # Store history for potential use in RL training
+        # Parse controller parameters
+        params = controller_params or {}
+        self.kp = params.get('kp', 0.1)
+        self.ki = params.get('ki', 0.01)
+        self.kd = params.get('kd', 0.0)
+        self.power_min = params.get('power_min', 0.0)
+        self.power_max = params.get('power_max', 500.0)
+        self.integral_limit = params.get('integral_limit', 100.0)
+        
+        # PID state variables
+        self.integral_error = 0.0
+        self.prev_error = 0.0
+        self.prev_time = None
+        
+        # Store history
         self.observation_history = []
         self.action_history = []
         self.power_history = []
+        self.error_history = []
+    
+    def _compute_pid_output(self, error: float, dt: float = 1.0) -> float:
+        """
+        Compute PID controller output.
+        
+        Parameters:
+        -----------
+        error : float
+            Temperature error (target - current)
+        dt : float
+            Time step (for integral and derivative terms). Default: 1.0
+        
+        Returns:
+        --------
+        float
+            Power adjustment (Watts)
+        """
+        # Proportional term
+        p_term = self.kp * error
+        
+        # Integral term (with anti-windup)
+        self.integral_error += error * dt
+        # Limit integral term to prevent windup
+        self.integral_error = np.clip(self.integral_error, -self.integral_limit, self.integral_limit)
+        i_term = self.ki * self.integral_error
+        
+        # Derivative term
+        if self.prev_time is not None and dt > 0:
+            d_error = (error - self.prev_error) / dt
+            d_term = self.kd * d_error
+        else:
+            d_term = 0.0
+        
+        # Update previous values
+        self.prev_error = error
+        self.prev_time = dt if self.prev_time is None else self.prev_time + dt
+        
+        # Total PID output
+        pid_output = p_term + i_term + d_term
+        
+        return pid_output
     
     def step(self, Levels: Union[List, Dict]) -> Tuple[float, bool]:
         """
@@ -270,17 +335,221 @@ class PowerController:
         should_update = should_update_power(self.step_count, self.update_interval)
         
         if should_update:
+            # Get observation (max temperature)
+            observation = get_max_temperature_level3(Levels)
+            
+            # Calculate error (target - current)
+            error = self.target_temperature - observation
+            
+            # Compute PID output (power adjustment)
+            # Use update_interval as time step for integral/derivative
+            dt = float(self.update_interval)  # Approximate time step
+            power_adjustment = self._compute_pid_output(error, dt)
+            
+            # Calculate new power
+            new_power = self.current_power + power_adjustment
+            
+            # Clamp to valid range
+            new_power = np.clip(new_power, self.power_min, self.power_max)
+            
+            # Update current power
+            self.current_power = new_power
+            
+            # Store history
+            self.observation_history.append(observation)
+            self.action_history.append(new_power)
+            self.power_history.append(self.current_power)
+            self.error_history.append(error)
+            
+            return new_power, True
+        else:
+            # No update, return current power
+            return self.current_power, False
+    
+    def get_current_power(self) -> float:
+        """Get the current power value."""
+        return self.current_power
+    
+    def reset(self, base_power: Optional[float] = None):
+        """Reset the controller (clear history, reset step count and PID state)."""
+        if base_power is not None:
+            self.current_power = base_power
+            self.base_power = base_power
+        else:
+            self.current_power = self.base_power
+        
+        self.step_count = 0
+        self.integral_error = 0.0
+        self.prev_error = 0.0
+        self.prev_time = None
+        self.observation_history.clear()
+        self.action_history.clear()
+        self.power_history.clear()
+        self.error_history.clear()
+    
+    def get_history(self) -> Dict:
+        """Get control history for analysis."""
+        return {
+            'observations': self.observation_history.copy(),
+            'actions': self.action_history.copy(),
+            'power': self.power_history.copy(),
+            'errors': self.error_history.copy(),
+            'steps': list(range(0, len(self.observation_history) * self.update_interval, self.update_interval))
+        }
+
+
+class PowerController:
+    """
+    RL Power Controller class for managing power updates during simulation.
+    
+    This class tracks step count and manages power adjustments at regular intervals.
+    Can use either a linear controller (default) or a trained RL agent.
+    """
+    
+    def __init__(
+        self,
+        target_temperature: float = 3000.0,
+        base_power: float = 285.0,
+        update_interval: int = 10,
+        controller_params: Optional[Dict] = None,
+        rl_model_path: Optional[str] = None
+    ):
+        """
+        Initialize the power controller.
+        
+        Parameters:
+        -----------
+        target_temperature : float
+            Target maximum temperature (Kelvin). Default: 3000.0
+        base_power : float
+            Initial/base power level (Watts). Default: 285.0
+        update_interval : int
+            Number of steps between power updates. Default: 10 (0.1m)
+        controller_params : dict, optional
+            Controller parameters (kp, power_min, power_max). Default: None
+        rl_model_path : str, optional
+            Path to trained RL model file (.zip). If provided, uses RL agent instead of linear controller.
+            Default: None (uses linear controller)
+        """
+        self.target_temperature = target_temperature
+        self.current_power = base_power
+        self.base_power = base_power
+        self.update_interval = update_interval
+        self.step_count = 0
+        self.controller_params = controller_params or {}
+        
+        # RL model (if provided)
+        self.rl_model = None
+        self.use_rl = False
+        self.temp_min = 0.0
+        self.temp_max = 5000.0
+        
+        if rl_model_path and os.path.exists(rl_model_path):
+            try:
+                from stable_baselines3 import PPO, SAC, TD3
+                
+                # Try to load the model (will auto-detect algorithm)
+                # First try PPO, then SAC, then TD3
+                try:
+                    self.rl_model = PPO.load(rl_model_path)
+                    self.use_rl = True
+                    print(f"Loaded RL model (PPO) from: {rl_model_path}")
+                except:
+                    try:
+                        self.rl_model = SAC.load(rl_model_path)
+                        self.use_rl = True
+                        print(f"Loaded RL model (SAC) from: {rl_model_path}")
+                    except:
+                        try:
+                            self.rl_model = TD3.load(rl_model_path)
+                            self.use_rl = True
+                            print(f"Loaded RL model (TD3) from: {rl_model_path}")
+                        except Exception as e:
+                            print(f"Warning: Failed to load RL model from {rl_model_path}: {e}")
+                            print("Falling back to linear controller.")
+                            self.rl_model = None
+                            self.use_rl = False
+            except ImportError:
+                print("Warning: stable-baselines3 not installed. Cannot load RL model.")
+                print("Install with: pip install stable-baselines3")
+                self.rl_model = None
+                self.use_rl = False
+        elif rl_model_path:
+            print(f"Warning: RL model path not found: {rl_model_path}")
+            print("Falling back to linear controller.")
+        
+        # Store history for potential use in RL training
+        self.observation_history = []
+        self.action_history = []
+        self.power_history = []
+    
+    def _normalize_temperature(self, temp: float) -> float:
+        """Normalize temperature to [0, 1] range for RL agent."""
+        return np.clip((temp - self.temp_min) / (self.temp_max - self.temp_min), 0.0, 1.0)
+    
+    def _action_to_power(self, action: np.ndarray) -> float:
+        """
+        Convert normalized RL action [-1, 1] to power value.
+        
+        Parameters:
+        -----------
+        action : np.ndarray
+            Normalized action from RL agent
+            
+        Returns:
+        --------
+        float
+            Power value in Watts
+        """
+        power_min = self.controller_params.get('power_min', 0.0)
+        power_max = self.controller_params.get('power_max', 500.0)
+        power_range = power_max - power_min
+        
+        # Action is power adjustment (relative to current)
+        power_adjustment = float(action[0]) * power_range * 0.01  # Scale to ±50% of range
+        new_power = self.current_power + power_adjustment
+        
+        # Clamp to valid range
+        new_power = np.clip(new_power, power_min, power_max)
+        return float(new_power)
+    
+    def step(self, Levels: Union[List, Dict]) -> Tuple[float, bool]:
+        """
+        Execute one control step.
+        
+        Parameters:
+        -----------
+        Levels : dict
+            Dictionary containing all level data
+        
+        Returns:
+        --------
+        tuple (float, bool)
+            - New power value (Watts)
+            - Whether power was updated this step (bool)
+        """
+        self.step_count += 1
+        should_update = should_update_power(self.step_count, self.update_interval)
+        
+        if should_update:
             # Get observation
             observation = get_observation(Levels)
             
             # Compute action (new power)
-            new_power = compute_power_action(
-                observation=observation,
-                target_temperature=self.target_temperature,
-                current_power=self.current_power,
-                base_power=self.base_power,
-                controller_params=self.controller_params
-            )
+            if self.use_rl and self.rl_model is not None:
+                # Use RL agent
+                normalized_obs = np.array([self._normalize_temperature(observation)], dtype=np.float32)
+                action, _ = self.rl_model.predict(normalized_obs, deterministic=True)
+                new_power = self._action_to_power(action)
+            else:
+                # Use linear controller
+                new_power = compute_power_action(
+                    observation=observation,
+                    target_temperature=self.target_temperature,
+                    current_power=self.current_power,
+                    base_power=self.base_power,
+                    controller_params=self.controller_params
+                )
             
             # Update current power
             self.current_power = new_power

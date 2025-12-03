@@ -140,6 +140,18 @@ def create_animation(results_dir, level=3, output_file=None, field='temperature'
     # Text actor reference for updating stats (will be created in loop)
     text_actor = None
     
+    # Try to load MSE statistics if available
+    mse_data = None
+    mse_file = os.path.join(results_dir, "mse_stats.json")
+    if os.path.exists(mse_file):
+        try:
+            import json
+            with open(mse_file, "r") as f:
+                mse_data = json.load(f)
+            print(f"Loaded MSE statistics: MSE={mse_data.get('mse', 'N/A'):.2f} K², RMSE={mse_data.get('rmse', 'N/A'):.2f} K")
+        except Exception as e:
+            print(f"Warning: Could not load MSE statistics: {e}")
+    
     # Create frames
     print("Creating animation frames...")
     frames = []
@@ -177,6 +189,11 @@ def create_animation(results_dir, level=3, output_file=None, field='temperature'
                          f"Avg Temperature: {avg_temp:.2f} K")
             if current_power is not None:
                 stats_text += f"\nCurrent Power: {current_power:.2f} W"
+            if mse_data is not None:
+                stats_text += (f"\n\nControl Performance:\n"
+                             f"Target: {mse_data.get('target_temperature', 0):.0f} K\n"
+                             f"MSE: {mse_data.get('mse', 0):.2f} K²\n"
+                             f"RMSE: {mse_data.get('rmse', 0):.2f} K")
             
             text_actor = plotter.add_text(
                 stats_text,
@@ -343,6 +360,18 @@ def create_overview_animation(results_dir, output_file=None, field='temperature'
     # Text actor reference for updating stats (will be created in loop)
     text_actor = None
     
+    # Try to load MSE statistics if available
+    mse_data = None
+    mse_file = os.path.join(results_dir, "mse_stats.json")
+    if os.path.exists(mse_file):
+        try:
+            import json
+            with open(mse_file, "r") as f:
+                mse_data = json.load(f)
+            print(f"Loaded MSE statistics: MSE={mse_data.get('mse', 'N/A'):.2f} K², RMSE={mse_data.get('rmse', 'N/A'):.2f} K")
+        except Exception as e:
+            print(f"Warning: Could not load MSE statistics: {e}")
+    
     # Create frames
     print("Creating combined overview animation frames...")
     frames = []
@@ -403,6 +432,11 @@ def create_overview_animation(results_dir, output_file=None, field='temperature'
                          f"Avg Temperature: {avg_temp:.2f} K")
             if current_power is not None:
                 stats_text += f"\nCurrent Power: {current_power:.2f} W"
+            if mse_data is not None:
+                stats_text += (f"\n\nControl Performance:\n"
+                             f"Target: {mse_data.get('target_temperature', 0):.0f} K\n"
+                             f"MSE: {mse_data.get('mse', 0):.2f} K²\n"
+                             f"RMSE: {mse_data.get('rmse', 0):.2f} K")
             
             text_actor = plotter.add_text(
                 stats_text,
