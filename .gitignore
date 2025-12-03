@@ -162,4 +162,3 @@ cython_debug/
 results
 checkpoints
 rl_training
-rl_training_layers
