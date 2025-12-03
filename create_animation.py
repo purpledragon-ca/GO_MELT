@@ -137,6 +137,9 @@ def create_animation(results_dir, level=3, output_file=None, field='temperature'
     # Store initial camera position for consistency
     initial_camera = plotter.camera.position
     
+    # Text actor reference for updating stats (will be created in loop)
+    text_actor = None
+    
     # Create frames
     print("Creating animation frames...")
     frames = []
@@ -150,6 +153,28 @@ def create_animation(results_dir, level=3, output_file=None, field='temperature'
         
         # Update mesh with new data
         plotter.update_scalars(grid[field_name], render=False)
+        
+        # Calculate and display Level 3 statistics if this is Level 3
+        if level == 3 and field == 'temperature':
+            temps = grid[field_name]
+            max_temp = np.max(temps)
+            avg_temp = np.mean(temps)
+            
+            # Remove previous text if it exists
+            if text_actor is not None:
+                plotter.remove_actor(text_actor)
+            
+            # Add text with statistics (top-left corner)
+            stats_text = (f"Level 3 Statistics:\n"
+                         f"Max Temperature: {max_temp:.2f} K\n"
+                         f"Avg Temperature: {avg_temp:.2f} K")
+            text_actor = plotter.add_text(
+                stats_text,
+                position='upper_left',
+                font_size=12,
+                color='black',
+                shadow=True
+            )
         
         # Keep camera position consistent
         plotter.camera.position = initial_camera
@@ -305,6 +330,9 @@ def create_overview_animation(results_dir, output_file=None, field='temperature'
     # Store initial camera position for consistency
     initial_camera = plotter.camera.position
     
+    # Text actor reference for updating stats (will be created in loop)
+    text_actor = None
+    
     # Create frames
     print("Creating combined overview animation frames...")
     frames = []
@@ -312,6 +340,9 @@ def create_overview_animation(results_dir, output_file=None, field='temperature'
     for frame_idx in range(max_files):
         if (frame_idx + 1) % 10 == 0:
             print(f"  Processing frame {frame_idx+1}/{max_files}")
+        
+        # Store Level 3 grid for statistics
+        level3_grid = None
         
         # Update each level
         for level in sorted(all_files.keys()):
@@ -321,6 +352,10 @@ def create_overview_animation(results_dir, output_file=None, field='temperature'
             
             # Read current file
             grid = pv.read(filepath)
+            
+            # Store Level 3 grid for statistics
+            if level == 3:
+                level3_grid = grid
             
             # Update mesh with new data
             # Note: We remove and re-add to ensure proper updates when geometry might change
@@ -333,6 +368,28 @@ def create_overview_animation(results_dir, output_file=None, field='temperature'
                 show_edges=False,
                 opacity=opacity_levels.get(level, 1.0),
                 scalar_bar_args=None
+            )
+        
+        # Calculate and display Level 3 statistics after all levels are updated
+        if level3_grid is not None and field == 'temperature':
+            temps = level3_grid[field_name]
+            max_temp = np.max(temps)
+            avg_temp = np.mean(temps)
+            
+            # Remove previous text if it exists
+            if text_actor is not None:
+                plotter.remove_actor(text_actor)
+            
+            # Add text with statistics (top-left corner)
+            stats_text = (f"Level 3 Statistics:\n"
+                         f"Max Temperature: {max_temp:.2f} K\n"
+                         f"Avg Temperature: {avg_temp:.2f} K")
+            text_actor = plotter.add_text(
+                stats_text,
+                position='upper_left',
+                font_size=12,
+                color='black',
+                shadow=True
             )
         
         # Keep camera position consistent
