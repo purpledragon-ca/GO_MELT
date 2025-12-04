@@ -6,13 +6,17 @@ This script creates a 3D temperature field animation showing the evolution
 of the thermal field during the simulation.
 
 Usage:
-    python create_animation.py [results_directory] [--level LEVEL] [--output OUTPUT_FILE]
-    python create_animation.py [results_directory] --overview [--output OUTPUT_FILE]
+    python gif_creator.py [results_directory] [--level LEVEL] [--output OUTPUT_FILE]
+    python gif_creator.py [results_directory] --overview [--output OUTPUT_FILE]
+    
+    If no results_directory is provided, the script will automatically find
+    the latest results directory based on modification time.
     
 Examples:
-    python create_animation.py results/example/
-    python create_animation.py results/example/ --level 3 --output my_animation.gif
-    python create_animation.py results/example/ --overview --output overview.gif
+    python gif_creator.py                          # Auto-detect latest results
+    python gif_creator.py results/example/         # Use specific directory
+    python gif_creator.py --level 3 --output my_animation.gif  # Auto-detect with options
+    python gif_creator.py results/example/ --overview --output overview.gif
 """
 
 import argparse
@@ -42,6 +46,57 @@ try:
 except ImportError:
     print("Error: numpy is required.")
     sys.exit(1)
+
+
+def find_latest_results_dir(search_dirs=None):
+    """
+    Find the latest results directory based on modification time.
+    
+    Parameters:
+    -----------
+    search_dirs : list of str, optional
+        Directories to search in for results. If None, searches 'results' and current directory.
+        
+    Returns:
+    --------
+    str or None
+        Path to the latest results directory, or None if none found
+    """
+    if search_dirs is None:
+        search_dirs = ['results', '.']
+    
+    # Find all directories that contain VTK files
+    candidate_dirs = []
+    
+    for search_dir in search_dirs:
+        if not os.path.exists(search_dir):
+            continue
+            
+        # Check if search_dir itself contains VTK files
+        vtk_files = glob.glob(os.path.join(search_dir, "Level*_*.vtr"))
+        if vtk_files:
+            candidate_dirs.append(os.path.abspath(search_dir))
+        
+        # Search in subdirectories of search_dir
+        if os.path.isdir(search_dir):
+            try:
+                for item in os.listdir(search_dir):
+                    item_path = os.path.join(search_dir, item)
+                    if os.path.isdir(item_path):
+                        # Check if this directory contains VTK files
+                        vtk_files = glob.glob(os.path.join(item_path, "Level*_*.vtr"))
+                        if vtk_files:
+                            candidate_dirs.append(os.path.abspath(item_path))
+            except PermissionError:
+                # Skip directories we can't read
+                continue
+    
+    if not candidate_dirs:
+        return None
+    
+    # Find the directory with the latest modification time
+    latest_dir = max(candidate_dirs, key=lambda d: os.path.getmtime(d))
+    return latest_dir
 
 
 def create_animation(results_dir, level=3, output_file=None, field='temperature', 
@@ -86,6 +141,20 @@ def create_animation(results_dir, level=3, output_file=None, field='temperature'
         if not folder_name:
             folder_name = os.path.basename(os.path.dirname(results_dir))
         output_file = f"{folder_name}_level{level}.gif"
+    
+    # Ensure output directory exists (results/gifs)
+    output_dir = "results/gifs"
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # If output_file is just a filename (no directory), save it to results/gifs
+    # If it's already a full path (absolute or relative with directory), use it as is
+    if not os.path.dirname(output_file):
+        # Just a filename, save to results/gifs
+        output_file = os.path.join(output_dir, output_file)
+    elif not os.path.isabs(output_file):
+        # Relative path with directory - still put in results/gifs for consistency
+        output_file = os.path.join(output_dir, os.path.basename(output_file))
+    # If absolute path, use it as is (no change needed)
     
     # Determine field name and colormap
     if field == 'temperature':
@@ -290,6 +359,20 @@ def create_overview_animation(results_dir, output_file=None, field='temperature'
         if not folder_name:
             folder_name = os.path.basename(os.path.dirname(results_dir))
         output_file = f"{folder_name}_overview.gif"
+    
+    # Ensure output directory exists (results/gifs)
+    output_dir = "results/gifs"
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # If output_file is just a filename (no directory), save it to results/gifs
+    # If it's already a full path (absolute or relative with directory), use it as is
+    if not os.path.dirname(output_file):
+        # Just a filename, save to results/gifs
+        output_file = os.path.join(output_dir, output_file)
+    elif not os.path.isabs(output_file):
+        # Relative path with directory - still put in results/gifs for consistency
+        output_file = os.path.join(output_dir, os.path.basename(output_file))
+    # If absolute path, use it as is (no change needed)
     
     # Determine field name and colormap
     if field == 'temperature':
@@ -502,8 +585,8 @@ def main():
         'results_dir',
         type=str,
         nargs='?',
-        default='results/example/',
-        help='Directory containing GO-MELT results (default: results/example/)'
+        default=None,
+        help='Directory containing GO-MELT results (default: auto-detect latest results directory)'
     )
     
     parser.add_argument(
@@ -555,6 +638,16 @@ def main():
     )
     
     args = parser.parse_args()
+    
+    # Auto-detect latest results directory if not provided
+    if args.results_dir is None:
+        print("No results directory specified. Searching for latest results directory...")
+        args.results_dir = find_latest_results_dir()
+        if args.results_dir is None:
+            print("Error: No results directory found. Please specify a directory or ensure")
+            print("       results exist in a 'results/' subdirectory or current directory.")
+            sys.exit(1)
+        print(f"Using latest results directory: {args.results_dir}")
     
     # Check if results directory exists
     if not os.path.isdir(args.results_dir):
