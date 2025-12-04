@@ -2,6 +2,8 @@ import os
 import sys
 import time
 import argparse
+import copy
+import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -30,73 +32,76 @@ except ImportError as e:
     print(f"Warning: Controllers not found ({str(e)}). Power control disabled.")
 
 
-def go_melt(solver_input: dict, input_file: str = None):
+# ============================================================================
+# Reusable Initialization Functions
+# ============================================================================
+
+def initialize_simulation_setup(solver_input):
     """
-    Main GO-MELT simulation driver. This function initializes the simulation,
-    sets up all levels, properties, and toolpath data, and prepares for time stepping.
-    Thermal solves using the GO-MELT algorithm are then used.
+    Initialize simulation properties, levels, nonmesh, and compute mesh ratios.
     
     Parameters:
     -----------
     solver_input : dict
         Dictionary containing all simulation configuration
-    input_file : str, optional
-        Path to the input JSON file (used for naming output directory)
-    """
-    tstart = time.time()  # Start timer
     
-    # Initialize flag for first moveEverything call
-    go_melt._first_move = False
-
-    level_names = ["L1", "L2", "L3"]
-
-    # -------------------------------
-    # Setup: Properties, Mesh, Nonmesh
-    # -------------------------------
+    Returns:
+    --------
+    tuple: (Properties, Levels, Nonmesh, ne_nn, subcycle, L1L2Eratio, L2L3Eratio)
+    """
     Properties = SetupProperties(solver_input.get("properties", {}))
     Levels = SetupLevels(solver_input, Properties)
     Nonmesh = SetupNonmesh(solver_input.get("nonmesh", {}))
-
-    # -------------------------------
+    
     # Static Mesh Metadata
-    # -------------------------------
     ne_nn = getStaticNodesAndElements(Levels)
     subcycle = getStaticSubcycle(Nonmesh)
-
-    # -------------------------------
+    
     # Mesh Ratios for Movement Logic
-    # -------------------------------
     L1L2Eratio = [
         int(jnp.round(Levels[1]["h"][i] / Levels[2]["h"][i])) for i in range(2)
     ] + [int(jnp.round(Properties["layer_height"] / Levels[2]["h"][2]))]
-
+    
     L2L3Eratio = [
         int(jnp.round(Levels[2]["h"][i] / Levels[3]["h"][i])) for i in range(3)
     ]
+    
+    return Properties, Levels, Nonmesh, ne_nn, subcycle, L1L2Eratio, L2L3Eratio
 
-    # -------------------------------
-    # Initialize Power Controller (PID or RL) - before other initialization
-    # -------------------------------
+
+def initialize_power_controller(solver_input, Properties):
+    """
+    Initialize power controller (PID or RL) if configured.
+    
+    Parameters:
+    -----------
+    solver_input : dict
+        Dictionary containing all simulation configuration
+    Properties : dict
+        Material properties dictionary
+    
+    Returns:
+    --------
+    tuple: (power_controller, controller_type)
+        power_controller: Controller instance or None
+        controller_type: str ("pid", "rl", or "none")
+    """
     power_controller = None
     controller_type = None
     
     if HAS_CONTROLLERS:
-        # Get controller configuration from solver_input
         controller_config = solver_input.get("power_controller", {})
-        controller_type = controller_config.get("type", "none").lower()  # "pid", "rl", or "none"
+        controller_type = controller_config.get("type", "none").lower()
         
         if controller_type in ["pid", "rl"]:
-            # Common parameters
             target_temp = controller_config.get("target_temperature", 3000.0)
             base_power = Properties["laser_power"]
-            update_interval = controller_config.get("update_interval", 10)  # Every 10 steps (0.1m)
+            update_interval = controller_config.get("update_interval", 10)
             controller_params = controller_config.get("controller_params", {})
             
             try:
                 if controller_type == "pid":
-                    # Initialize PID controller
                     if PIDController is not None:
-                        # Set default PID parameters if not provided
                         if "kp" not in controller_params:
                             controller_params["kp"] = 0.1
                         if "ki" not in controller_params:
@@ -120,9 +125,7 @@ def go_melt(solver_input: dict, input_file: str = None):
                         print("Warning: PIDController not available. Power control disabled.")
                 
                 elif controller_type == "rl":
-                    # Initialize RL controller
                     if RLController is not None:
-                        # Set default RL parameters if not provided
                         if "kp" not in controller_params:
                             controller_params["kp"] = 0.1
                         if "power_min" not in controller_params:
@@ -130,7 +133,6 @@ def go_melt(solver_input: dict, input_file: str = None):
                         if "power_max" not in controller_params:
                             controller_params["power_max"] = 500.0
                         
-                        # Check for RL model path
                         rl_model_path = controller_params.get("rl_model_path", None)
                         
                         power_controller = RLController(
@@ -145,7 +147,6 @@ def go_melt(solver_input: dict, input_file: str = None):
                         else:
                             print(f"RL Controller initialized (linear): target={target_temp}K, base_power={base_power}W")
                         
-                        # Flag to print observation on first use
                         power_controller._print_first_observation = True
                     else:
                         print("Warning: RLController (RL) not available. Power control disabled.")
@@ -154,49 +155,54 @@ def go_melt(solver_input: dict, input_file: str = None):
                 print(f"Warning: Failed to initialize {controller_type.upper()} controller: {e}")
                 power_controller = None
         else:
-            # No controller or invalid type
             if controller_type != "none":
                 print(f"Warning: Unknown controller type '{controller_type}'. Valid options: 'pid', 'rl', 'none'")
             print("Running without power controller (using toolpath power).")
+    
+    return power_controller, controller_type
 
-    # -------------------------------
-    # Update Save Path with Timestamp and Controller Type/JSON Name
-    # -------------------------------
-    # Generate timestamp
+
+def setup_save_path(Nonmesh, input_file, controller_type):
+    """
+    Setup save path with timestamp and update Nonmesh.
+    
+    Parameters:
+    -----------
+    Nonmesh : dict
+        Nonmesh configuration dictionary
+    input_file : str, optional
+        Path to the input JSON file
+    controller_type : str
+        Controller type ("pid", "rl", or "none")
+    
+    Returns:
+    --------
+    Nonmesh : dict
+        Updated Nonmesh with new save_path and toolpath
+    """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    # Extract JSON name from input file (without extension)
     if input_file:
-        json_name = Path(input_file).stem  # Get filename without extension
+        json_name = Path(input_file).stem
     else:
-        # Fallback: use controller type or "none"
         json_name = controller_type if controller_type else "none"
     
-    # Get base save path from Nonmesh
     base_save_path = Nonmesh.get("save_path", "./results/")
-    
-    # Create new save path: base_path/timestamp_jsonname/
-    # If save_path is "./results/example/", we want "./results/timestamp_jsonname/"
     base_path = Path(base_save_path.rstrip("/")).parent
     new_save_path = base_path / f"{timestamp}_{json_name}"
     
-    # Ensure directory exists
     new_save_path.mkdir(parents=True, exist_ok=True)
     new_save_path_str = str(new_save_path) + "/"
     
-    # Update Nonmesh save_path
     Nonmesh["save_path"] = new_save_path_str
     
-    # Update toolpath path to be in the new save directory
     original_toolpath = Nonmesh.get("toolpath", "./results/example/toolpath.txt")
     toolpath_filename = Path(original_toolpath).name
     new_toolpath = new_save_path / toolpath_filename
     
-    # If using existing txt file, copy it to new location
     if Nonmesh.get("use_txt", 0):
         original_toolpath_path = Path(original_toolpath)
         if original_toolpath_path.exists():
-            import shutil
             shutil.copy2(original_toolpath_path, new_toolpath)
             print(f"Copied toolpath file to: {new_toolpath}")
         else:
@@ -205,20 +211,36 @@ def go_melt(solver_input: dict, input_file: str = None):
     Nonmesh["toolpath"] = str(new_toolpath)
     
     print(f"Results will be saved to: {new_save_path_str}")
+    
+    return Nonmesh
 
-    # -------------------------------
-    # Toolpath Parsing
-    # -------------------------------
+
+def initialize_toolpath(Nonmesh, Properties, Levels):
+    """
+    Parse toolpath and get initial laser position.
+    
+    Parameters:
+    -----------
+    Nonmesh : dict
+        Nonmesh configuration dictionary
+    Properties : dict
+        Material properties dictionary
+    Levels : dict
+        Levels dictionary
+    
+    Returns:
+    --------
+    tuple: (total_t_inc, laser_start)
+        total_t_inc: int, total time steps
+        laser_start: np.ndarray, initial laser position
+    """
     if Nonmesh["use_txt"]:
         move_mesh = count_lines(Nonmesh["toolpath"])
     else:
         move_mesh = parsingGcode(Nonmesh, Properties, Levels[2]["h"])
-
-    total_t_inc = move_mesh  # Total time steps
-
-    # -------------------------------
-    # Initial Laser Position
-    # -------------------------------
+    
+    total_t_inc = move_mesh
+    
     if not Properties["laser_center"]:
         with open(Nonmesh["toolpath"], "r") as tool_path_file:
             laser_start = np.array(
@@ -226,52 +248,462 @@ def go_melt(solver_input: dict, input_file: str = None):
             )
     else:
         laser_start = np.array(Properties["laser_center"])
+    
+    return total_t_inc, laser_start
 
-    # -------------------------------
-    # Interpolation Matrices
-    # -------------------------------
+
+def initialize_interpolation(Levels):
+    """
+    Initialize interpolation matrices between levels.
+    
+    Parameters:
+    -----------
+    Levels : dict
+        Levels dictionary
+    
+    Returns:
+    --------
+    LInterp : list
+        List of interpolation matrices [L1L2Interp, L2L3Interp]
+    """
     L1L2Interp = interpolatePointsMatrix(Levels[1], Levels[2]["node_coords"])
     L2L3Interp = interpolatePointsMatrix(Levels[2], Levels[3]["node_coords"])
     LInterp = [L1L2Interp, L2L3Interp]
+    
+    return LInterp
 
-    # -------------------------------
-    # Time & Output Initialization
-    # -------------------------------
+
+def initialize_time_tracking(Levels, Nonmesh, power_controller, Properties=None):
+    """
+    Initialize time tracking, error tracking, and layer tracking variables.
+    
+    Parameters:
+    -----------
+    Levels : dict
+        Levels dictionary
+    Nonmesh : dict
+        Nonmesh configuration dictionary
+    power_controller : object or None
+        Power controller instance
+    Properties : dict, optional
+        Material properties dictionary (for getting initial power)
+    
+    Returns:
+    --------
+    dict: Dictionary containing all tracking variables
+    """
     time_inc = record_inc = wait_inc = 0
     t_output = 0.0
     savenum = int(time_inc / Nonmesh["record_step"]) + 1
-    # Get initial power for saving
-    initial_power = Properties["laser_power"]
-    if power_controller is not None:
-        initial_power = power_controller.get_current_power()
-    saveResults(Levels, Nonmesh, savenum, power=initial_power)
     
-    # -------------------------------
-    # Error Tracking for MSE Calculation
-    # -------------------------------
-    temperature_errors = []  # Store squared errors: (target_temp - max_temp)^2
+    initial_power = 0.0
+    if Properties is not None and "laser_power" in Properties:
+        initial_power = Properties["laser_power"]
+    
+    temperature_errors = []
     target_temperature = None
     if power_controller is not None:
         target_temperature = power_controller.target_temperature
-
-    # -------------------------------
-    # Layer Tracking & Accumulation
-    # -------------------------------
+        initial_power = power_controller.get_current_power()
+    
     laser_prev_z = float("inf")
     _dwell_time_count = 0
     record_accum = True
-
+    
     if record_accum:
         accum_time = jnp.zeros(Levels[0]["nn"])
         max_accum_time = jnp.zeros(Levels[0]["nn"])
-
-    move_hist = [jnp.array(0), jnp.array(0), jnp.array(0)]  # Laser movement history
-
-    # -------------------------------
-    # Simulation Flags
-    # -------------------------------
+    else:
+        accum_time = None
+        max_accum_time = None
+    
+    move_hist = [jnp.array(0), jnp.array(0), jnp.array(0)]
+    
     force_move = move_vert = new_checkpoint = False
     ongoing_simulation = single_step = True
+    
+    return {
+        "time_inc": time_inc,
+        "record_inc": record_inc,
+        "wait_inc": wait_inc,
+        "t_output": t_output,
+        "savenum": savenum,
+        "temperature_errors": temperature_errors,
+        "target_temperature": target_temperature,
+        "laser_prev_z": laser_prev_z,
+        "_dwell_time_count": _dwell_time_count,
+        "record_accum": record_accum,
+        "accum_time": accum_time,
+        "max_accum_time": max_accum_time,
+        "move_hist": move_hist,
+        "force_move": force_move,
+        "move_vert": move_vert,
+        "new_checkpoint": new_checkpoint,
+        "ongoing_simulation": ongoing_simulation,
+        "single_step": single_step,
+        "initial_power": initial_power
+    }
+
+
+def load_checkpoint(Nonmesh, Levels, tool_path_file):
+    """
+    Load checkpoint if requested.
+    
+    Parameters:
+    -----------
+    Nonmesh : dict
+        Nonmesh configuration dictionary
+    Levels : dict
+        Levels dictionary (will be updated)
+    tool_path_file : file object
+        Open toolpath file
+    
+    Returns:
+    --------
+    tuple: (load_chkpt, time_inc_loaded, record_inc)
+        load_chkpt: bool, whether checkpoint was loaded
+        time_inc_loaded: int, time increment from checkpoint
+        record_inc: int, record increment from checkpoint
+    """
+    if Nonmesh["layer_num"] > 0:
+        print(f"Loading checkpoint: Layer {Nonmesh['layer_num']}")
+        np_path = Path(Nonmesh["save_path"] + "checkpoint").absolute()
+        FILENAME = f"Checkpoint{str(Nonmesh['layer_num']).zfill(4)}.pkl"
+        
+        with open(np_path.joinpath(FILENAME), "rb") as f:
+            Levels, accum_time, max_accum_time, time_inc_loaded, record_inc = dill.load(f)
+        
+        load_chkpt = True
+        line_len = len(tool_path_file.readline())
+        tool_path_file.seek(time_inc_loaded * line_len)
+        
+        return load_chkpt, time_inc_loaded, record_inc, accum_time, max_accum_time
+    else:
+        return False, 0, 0, None, None
+
+
+def warmup_jax_compilation(laser_start, Levels, LInterp, L1L2Eratio, L2L3Eratio, Properties, load_chkpt):
+    """
+    Warm-up JAX compilation to avoid GPU graph capture errors.
+    
+    Parameters:
+    -----------
+    laser_start : np.ndarray
+        Initial laser position
+    Levels : dict
+        Levels dictionary
+    LInterp : list
+        Interpolation matrices
+    L1L2Eratio : list
+        Level 1 to Level 2 element ratios
+    L2L3Eratio : list
+        Level 2 to Level 3 element ratios
+    Properties : dict
+        Material properties dictionary
+    load_chkpt : bool
+        Whether checkpoint was loaded (skip warm-up if True)
+    """
+    if not load_chkpt:
+        try:
+            print("Warming up JAX compilation...")
+            from computeFunctions import moveEverything
+            
+            warmup_v = jnp.array([laser_start[0], laser_start[1], laser_start[2], 0.0, 0.0, 0.0, Properties["laser_power"]], dtype=jnp.float32)
+            warmup_move_hist = [jnp.array(0, dtype=jnp.float32), jnp.array(0, dtype=jnp.float32), jnp.array(0, dtype=jnp.float32)]
+            
+            result = moveEverything(
+                warmup_v,
+                laser_start,
+                Levels,
+                warmup_move_hist,
+                LInterp,
+                L1L2Eratio,
+                L2L3Eratio,
+                Properties["layer_height"],
+            )
+            
+            if isinstance(result, tuple):
+                _ = [x.block_until_ready() if hasattr(x, 'block_until_ready') else None for x in result if x is not None]
+            else:
+                _ = result.block_until_ready() if hasattr(result, 'block_until_ready') else None
+            
+            if hasattr(moveEverything, '_clear_cache'):
+                moveEverything._clear_cache()
+            print("Warm-up complete.")
+        except Exception as e:
+            print(f"Warning: Warm-up failed: {e}")
+            print("This may cause GPU graph capture errors. Continuing anyway...")
+            import traceback
+            traceback.print_exc()
+
+
+def handle_layer_change(laser_pos, laser_prev_z, Levels, Properties, LInterp, Nonmesh, 
+                       load_chkpt, record_accum, accum_time, max_accum_time):
+    """
+    Handle layer change logic.
+    
+    Parameters:
+    -----------
+    laser_pos : jnp.ndarray
+        Current laser position
+    laser_prev_z : float
+        Previous z-coordinate
+    Levels : dict
+        Levels dictionary (will be updated)
+    Properties : dict
+        Material properties dictionary
+    LInterp : list
+        Interpolation matrices (will be updated)
+    Nonmesh : dict
+        Nonmesh configuration dictionary
+    load_chkpt : bool
+        Whether loading from checkpoint
+    record_accum : bool
+        Whether to record accumulation
+    accum_time : jnp.ndarray
+        Accumulated time array
+    max_accum_time : jnp.ndarray
+        Maximum accumulated time array
+    
+    Returns:
+    --------
+    tuple: (LInterp, tmp_ne_nn, laser_prev_z, force_move, move_vert, wait_inc, accum_time, max_accum_time)
+    """
+    if laser_pos[2] != laser_prev_z:
+        trying_flag = True
+        tmp_coords = copy.deepcopy(Levels[1]["orig_node_coords"])
+        _L1T_state_idx = 0
+        
+        while trying_flag:
+            if jnp.isclose(tmp_coords[2] - laser_pos[2], 0, atol=1e-4).any():
+                trying_flag = False
+            else:
+                tmp_coords[2] += Properties["layer_height"]
+                _L1T_state_idx += 1
+        
+        if not load_chkpt:
+            Levels[1]["T0"] = jnp.maximum(
+                interpolatePoints(Levels[1], Levels[1]["T0"], tmp_coords),
+                Properties["T_amb"],
+            )
+            Levels[1]["S1_storage"] = (
+                Levels[1]["S1_storage"]
+                .at[_L1T_state_idx - 1, :]
+                .set(Levels[1]["S1"])
+            )
+            Levels[1]["S1"] = Levels[1]["S1_storage"][_L1T_state_idx, :]
+            Levels[1]["node_coords"] = copy.deepcopy(tmp_coords)
+        
+        L1L2Interp = interpolatePointsMatrix(Levels[1], Levels[2]["node_coords"])
+        L2L3Interp = interpolatePointsMatrix(Levels[2], Levels[3]["node_coords"])
+        LInterp = [L1L2Interp, L2L3Interp]
+        tmp_ne_nn = calcStaticTmpNodesAndElements(Levels, laser_pos)
+        
+        laser_prev_z = laser_pos[2]
+        force_move = True
+        wait_inc = 0
+        move_vert = True
+        
+        if not load_chkpt:
+            saveState(Levels[0], "Level0_", Nonmesh["layer_num"], Nonmesh["save_path"], 0)
+            
+            if record_accum:
+                accum_time = jnp.maximum(accum_time, max_accum_time)
+                jnp.savez(
+                    Nonmesh["save_path"] + "accum_time" + str(Nonmesh["layer_num"]).zfill(4),
+                    accum_time=accum_time,
+                )
+            
+            _0nn1 = (
+                Levels[0]["nodes"][0]
+                * Levels[0]["nodes"][1]
+                * Levels[0]["layer_idx_delta"]
+            )
+            _0nn2 = (
+                Levels[0]["nodes"][0]
+                * Levels[0]["nodes"][1]
+                * (Levels[0]["nodes"][2] - Levels[0]["layer_idx_delta"])
+            )
+            
+            Levels[0]["S1"] = Levels[0]["S1"].at[:_0nn2].set(Levels[0]["S1"][_0nn1:])
+            Levels[0]["S1"] = Levels[0]["S1"].at[_0nn2:].set(0)
+            
+            Levels[0]["node_coords"][2] = (
+                Levels[0]["orig_node_coords"][2]
+                + laser_pos[2]
+                - Levels[0]["orig_node_coords"][2][-1]
+            )
+            
+            if record_accum:
+                max_accum_time = jnp.zeros(Levels[0]["nn"])
+                accum_time = accum_time.at[:_0nn2].set(accum_time[_0nn1:])
+                accum_time = accum_time.at[_0nn2:].set(0)
+        
+        return LInterp, tmp_ne_nn, laser_prev_z, force_move, move_vert, wait_inc, accum_time, max_accum_time
+    else:
+        # No layer change, return current values
+        tmp_ne_nn = calcStaticTmpNodesAndElements(Levels, laser_pos)
+        return LInterp, tmp_ne_nn, laser_prev_z, False, False, None, accum_time, max_accum_time
+
+
+def finalize_simulation(Levels, Nonmesh, power_controller, target_temperature, 
+                       temperature_errors, controller_type, record_accum, accum_time, max_accum_time, Properties=None):
+    """
+    Finalize simulation: save results, calculate MSE, and cleanup.
+    
+    Parameters:
+    -----------
+    Levels : dict
+        Levels dictionary
+    Nonmesh : dict
+        Nonmesh configuration dictionary
+    power_controller : object or None
+        Power controller instance
+    target_temperature : float or None
+        Target temperature for MSE calculation
+    temperature_errors : list
+        List of squared temperature errors
+    controller_type : str
+        Controller type
+    record_accum : bool
+        Whether accumulation was recorded
+    accum_time : jnp.ndarray or None
+        Accumulated time array
+    max_accum_time : jnp.ndarray or None
+        Maximum accumulated time array
+    Properties : dict, optional
+        Material properties dictionary (for getting final power)
+    """
+    saveState(Levels[0], "Level0_", Nonmesh["layer_num"], Nonmesh["save_path"], 0)
+    
+    final_power = 0.0
+    if Properties is not None and "laser_power" in Properties:
+        final_power = Properties["laser_power"]
+    if power_controller is not None:
+        final_power = power_controller.get_current_power()
+    
+    saveResultsFinal(Levels, Nonmesh, power=final_power)
+    
+    jnp.savez(
+        f"{Nonmesh['save_path']}FinalTemperatureFields",
+        L1T=Levels[1]["T0"],
+        L2T=Levels[2]["T0"],
+        L3T=Levels[3]["T0"],
+    )
+    
+    if record_accum and accum_time is not None and max_accum_time is not None:
+        accum_time = jnp.maximum(accum_time, max_accum_time)
+        jnp.savez(
+            Nonmesh["save_path"] + "accum_time" + str(Nonmesh["layer_num"]).zfill(4),
+            accum_time=accum_time,
+        )
+    
+    if target_temperature is not None and len(temperature_errors) > 0:
+        mse = np.mean(temperature_errors)
+        rmse = np.sqrt(mse)
+        print(f"\n{'='*60}")
+        print(f"Temperature Control Statistics:")
+        print(f"  Target Temperature: {target_temperature:.2f} K")
+        print(f"  Mean Squared Error (MSE): {mse:.2f} K²")
+        print(f"  Root Mean Squared Error (RMSE): {rmse:.2f} K")
+        print(f"  Number of samples: {len(temperature_errors)}")
+        print(f"{'='*60}\n")
+        
+        mse_data = {
+            "target_temperature": float(target_temperature),
+            "mse": float(mse),
+            "rmse": float(rmse),
+            "num_samples": len(temperature_errors),
+            "controller_type": controller_type if controller_type else "none"
+        }
+        mse_file = Path(Nonmesh["save_path"]) / "mse_stats.json"
+        with open(mse_file, "w") as f:
+            json.dump(mse_data, f, indent=2)
+        print(f"MSE statistics saved to: {mse_file}")
+    else:
+        print("\nNo temperature control active - MSE not calculated.\n")
+    
+    try:
+        stepGOMELT._clear_cache()
+        stepGOMELTDwellTime._clear_cache()
+        subcycleGOMELT._clear_cache()
+        moveEverything._clear_cache()
+        gc.collect()
+    except:
+        gc.collect()
+    
+    print("\nSimulation completed.")
+
+
+def go_melt(solver_input: dict, input_file: str = None):
+    """
+    Main GO-MELT simulation driver. This function initializes the simulation,
+    sets up all levels, properties, and toolpath data, and prepares for time stepping.
+    Thermal solves using the GO-MELT algorithm are then used.
+    
+    Parameters:
+    -----------
+    solver_input : dict
+        Dictionary containing all simulation configuration
+    input_file : str, optional
+        Path to the input JSON file (used for naming output directory)
+    """
+    tstart = time.time()  # Start timer
+    
+    # Initialize flag for first moveEverything call
+    go_melt._first_move = False
+
+    # -------------------------------
+    # Initialize Simulation Setup
+    # -------------------------------
+    Properties, Levels, Nonmesh, ne_nn, subcycle, L1L2Eratio, L2L3Eratio = initialize_simulation_setup(solver_input)
+
+    # -------------------------------
+    # Initialize Power Controller
+    # -------------------------------
+    power_controller, controller_type = initialize_power_controller(solver_input, Properties)
+
+    # -------------------------------
+    # Setup Save Path
+    # -------------------------------
+    Nonmesh = setup_save_path(Nonmesh, input_file, controller_type)
+
+    # -------------------------------
+    # Initialize Toolpath
+    # -------------------------------
+    total_t_inc, laser_start = initialize_toolpath(Nonmesh, Properties, Levels)
+
+    # -------------------------------
+    # Initialize Interpolation
+    # -------------------------------
+    LInterp = initialize_interpolation(Levels)
+
+    # -------------------------------
+    # Initialize Time Tracking
+    # -------------------------------
+    tracking = initialize_time_tracking(Levels, Nonmesh, power_controller, Properties)
+    time_inc = tracking["time_inc"]
+    record_inc = tracking["record_inc"]
+    wait_inc = tracking["wait_inc"]
+    t_output = tracking["t_output"]
+    savenum = tracking["savenum"]
+    temperature_errors = tracking["temperature_errors"]
+    target_temperature = tracking["target_temperature"]
+    laser_prev_z = tracking["laser_prev_z"]
+    _dwell_time_count = tracking["_dwell_time_count"]
+    record_accum = tracking["record_accum"]
+    accum_time = tracking["accum_time"]
+    max_accum_time = tracking["max_accum_time"]
+    move_hist = tracking["move_hist"]
+    force_move = tracking["force_move"]
+    move_vert = tracking["move_vert"]
+    new_checkpoint = tracking["new_checkpoint"]
+    ongoing_simulation = tracking["ongoing_simulation"]
+    single_step = tracking["single_step"]
+    initial_power = tracking["initial_power"]
+    
+    # Save initial results
+    saveResults(Levels, Nonmesh, savenum, power=initial_power)
 
     # -------------------------------
     # Toolpath File & Checkpointing
@@ -283,65 +715,21 @@ def go_melt(solver_input: dict, input_file: str = None):
     # -------------------------------
     # Load Checkpoint if Requested
     # -------------------------------
-    if Nonmesh["layer_num"] > 0:
-        # Loading checkpoint for Layer {Nonmesh['layer_num']}
-        print(f"Loading checkpoint: Layer {Nonmesh['layer_num']}")
-        FILENAME = f"Checkpoint{str(Nonmesh['layer_num']).zfill(4)}.pkl"
-
-        with open(np_path.joinpath(FILENAME), "rb") as f:
-            Levels, accum_time, max_accum_time, time_inc_loaded, record_inc = dill.load(
-                f
-            )
-
-        load_chkpt = True
-        line_len = len(tool_path_file.readline())
-        tool_path_file.seek(time_inc_loaded * line_len)
+    load_chkpt, time_inc_loaded, record_inc_loaded, accum_time_loaded, max_accum_time_loaded = load_checkpoint(
+        Nonmesh, Levels, tool_path_file
+    )
+    if load_chkpt:
         time_inc += time_inc_loaded
-    else:
-        load_chkpt = False
+        record_inc = record_inc_loaded
+        if accum_time_loaded is not None:
+            accum_time = accum_time_loaded
+        if max_accum_time_loaded is not None:
+            max_accum_time = max_accum_time_loaded
 
     # -------------------------------
-    # Warm-up moveEverything to avoid GPU graph capture errors
+    # Warm-up JAX Compilation
     # -------------------------------
-    # Force JAX to compile moveEverything before the main loop
-    # This prevents "Failed to capture gpu graph" errors, especially with PID controller
-    if not load_chkpt:
-        try:
-            print("Warming up JAX compilation...")
-            # Ensure moveEverything is available (imported via computeFunctions import *)
-            # Import explicitly to ensure it's in scope
-            from computeFunctions import moveEverything
-            
-            # Create dummy inputs for warm-up (use same position to avoid actual movement)
-            # Use explicit float32 dtype for consistency
-            warmup_v = jnp.array([laser_start[0], laser_start[1], laser_start[2], 0.0, 0.0, 0.0, Properties["laser_power"]], dtype=jnp.float32)
-            warmup_move_hist = [jnp.array(0, dtype=jnp.float32), jnp.array(0, dtype=jnp.float32), jnp.array(0, dtype=jnp.float32)]
-            # Warm-up call - this forces JAX to compile without GPU graph capture
-            # Use block_until_ready() to ensure compilation happens
-            result = moveEverything(
-                warmup_v,
-                laser_start,
-                Levels,
-                warmup_move_hist,
-                LInterp,
-                L1L2Eratio,
-                L2L3Eratio,
-                Properties["layer_height"],
-            )
-            # Force execution to complete - handle tuple result properly
-            if isinstance(result, tuple):
-                _ = [x.block_until_ready() if hasattr(x, 'block_until_ready') else None for x in result if x is not None]
-            else:
-                _ = result.block_until_ready() if hasattr(result, 'block_until_ready') else None
-            # Clear cache after warm-up to ensure fresh compilation in main loop
-            if hasattr(moveEverything, '_clear_cache'):
-                moveEverything._clear_cache()
-            print("Warm-up complete.")
-        except Exception as e:
-            print(f"Warning: Warm-up failed: {e}")
-            print("This may cause GPU graph capture errors. Continuing anyway...")
-            import traceback
-            traceback.print_exc()
+    warmup_jax_compilation(laser_start, Levels, LInterp, L1L2Eratio, L2L3Eratio, Properties, load_chkpt)
 
     # -------------------------------
     # Start Time Loop
@@ -390,6 +778,9 @@ def go_melt(solver_input: dict, input_file: str = None):
         # Single-Step Execution (Equal time step for each Level)
         # -----------------------------------
         if single_step:
+            # Initialize substrate before first use
+            substrate = getSubstrateNodes(Levels)
+            
             for laser_pos in laser_all:
                 wait_inc = wait_inc + 1 if laser_pos[4] == 0 else 0
 
@@ -410,98 +801,14 @@ def go_melt(solver_input: dict, input_file: str = None):
                 # Handle Layer Change
                 # -----------------------------------
                 if laser_pos[2] != laser_prev_z:
-                    trying_flag = True
-                    tmp_coords = copy.deepcopy(Levels[1]["orig_node_coords"])
-                    _L1T_state_idx = 0
-
-                    # Find matching z-layer in Level 1
-                    while trying_flag:
-                        if jnp.isclose(
-                            tmp_coords[2] - laser_pos[2], 0, atol=1e-4
-                        ).any():
-                            trying_flag = False
-                        else:
-                            tmp_coords[2] += Properties["layer_height"]
-                            _L1T_state_idx += 1
-
-                    # Update Level 1 state if not loading from checkpoint
-                    if not load_chkpt:
-                        Levels[1]["T0"] = jnp.maximum(
-                            interpolatePoints(Levels[1], Levels[1]["T0"], tmp_coords),
-                            Properties["T_amb"],
-                        )
-                        Levels[1]["S1_storage"] = (
-                            Levels[1]["S1_storage"]
-                            .at[_L1T_state_idx - 1, :]
-                            .set(Levels[1]["S1"])
-                        )
-                        Levels[1]["S1"] = Levels[1]["S1_storage"][_L1T_state_idx, :]
-                        Levels[1]["node_coords"] = copy.deepcopy(tmp_coords)
-
-                    # Update interpolation matrices and static node/element info
-                    L1L2Interp = interpolatePointsMatrix(
-                        Levels[1], Levels[2]["node_coords"]
+                    LInterp, tmp_ne_nn, laser_prev_z, force_move, move_vert, wait_inc_new, accum_time, max_accum_time = handle_layer_change(
+                        laser_pos, laser_prev_z, Levels, Properties, LInterp, Nonmesh,
+                        load_chkpt, record_accum, accum_time, max_accum_time
                     )
-                    L2L3Interp = interpolatePointsMatrix(
-                        Levels[2], Levels[3]["node_coords"]
-                    )
-                    LInterp = [L1L2Interp, L2L3Interp]
+                    if wait_inc_new is not None:
+                        wait_inc = wait_inc_new
+                else:
                     tmp_ne_nn = calcStaticTmpNodesAndElements(Levels, laser_pos)
-
-                    # Update layer tracking and flags
-                    laser_prev_z = laser_pos[2]
-                    force_move = True
-                    wait_inc = 0
-                    move_vert = True
-
-                    if not load_chkpt:
-                        # Save Level 0 state at the start of a new layer
-                        saveState(
-                            Levels[0],
-                            "Level0_",
-                            Nonmesh["layer_num"],
-                            Nonmesh["save_path"],
-                            0,
-                        )
-
-                        if record_accum:
-                            # Save accumulated melt time
-                            accum_time = jnp.maximum(accum_time, max_accum_time)
-                            jnp.savez(
-                                Nonmesh["save_path"]
-                                + "accum_time"
-                                + str(Nonmesh["layer_num"]).zfill(4),
-                                accum_time=accum_time,
-                            )
-
-                        # Shift Level 0 data down to simulate vertical mesh movement
-                        _0nn1 = (
-                            Levels[0]["nodes"][0]
-                            * Levels[0]["nodes"][1]
-                            * Levels[0]["layer_idx_delta"]
-                        )
-                        _0nn2 = (
-                            Levels[0]["nodes"][0]
-                            * Levels[0]["nodes"][1]
-                            * (Levels[0]["nodes"][2] - Levels[0]["layer_idx_delta"])
-                        )
-
-                        Levels[0]["S1"] = (
-                            Levels[0]["S1"].at[:_0nn2].set(Levels[0]["S1"][_0nn1:])
-                        )
-                        Levels[0]["S1"] = Levels[0]["S1"].at[_0nn2:].set(0)
-
-                        # Update z-coordinates for Level 0
-                        Levels[0]["node_coords"][2] = (
-                            Levels[0]["orig_node_coords"][2]
-                            + laser_pos[2]
-                            - Levels[0]["orig_node_coords"][2][-1]
-                        )
-
-                        if record_accum:
-                            max_accum_time = jnp.zeros(Levels[0]["nn"])
-                            accum_time = accum_time.at[:_0nn2].set(accum_time[_0nn1:])
-                            accum_time = accum_time.at[_0nn2:].set(0)
 
                 force_move = True
 
@@ -670,6 +977,10 @@ def go_melt(solver_input: dict, input_file: str = None):
                 load_chkpt = False
 
         else:  # Subcycling mode
+            # Initialize substrate and tmp_ne_nn before use
+            substrate = getSubstrateNodes(Levels)
+            tmp_ne_nn = calcStaticTmpNodesAndElements(Levels, laser_all[0, :])
+            
             # Update wait time if laser is off
             wait_inc = (
                 wait_inc + len(laser_all) - laser_all[:, 4].sum()
@@ -792,70 +1103,11 @@ def go_melt(solver_input: dict, input_file: str = None):
     # Finalization
     # -----------------------------------
     tool_path_file.close()
-
-    # Save final Level 0 state and temperature fields
-    saveState(Levels[0], "Level0_", Nonmesh["layer_num"], Nonmesh["save_path"], 0)
-    # Get final power for saving
-    final_power = Properties["laser_power"]
-    if power_controller is not None:
-        final_power = power_controller.get_current_power()
-    saveResultsFinal(Levels, Nonmesh, power=final_power)
-
-    jnp.savez(
-        f"{Nonmesh['save_path']}FinalTemperatureFields",
-        L1T=Levels[1]["T0"],
-        L2T=Levels[2]["T0"],
-        L3T=Levels[3]["T0"],
+    
+    finalize_simulation(
+        Levels, Nonmesh, power_controller, target_temperature,
+        temperature_errors, controller_type, record_accum, accum_time, max_accum_time, Properties
     )
-
-    if record_accum:
-        accum_time = jnp.maximum(accum_time, max_accum_time)
-        jnp.savez(
-            Nonmesh["save_path"] + "accum_time" + str(Nonmesh["layer_num"]).zfill(4),
-            accum_time=accum_time,
-        )
-
-    # -------------------------------
-    # Calculate and Print Mean Squared Error (MSE)
-    # -------------------------------
-    if target_temperature is not None and len(temperature_errors) > 0:
-        mse = np.mean(temperature_errors)
-        rmse = np.sqrt(mse)
-        print(f"\n{'='*60}")
-        print(f"Temperature Control Statistics:")
-        print(f"  Target Temperature: {target_temperature:.2f} K")
-        print(f"  Mean Squared Error (MSE): {mse:.2f} K²")
-        print(f"  Root Mean Squared Error (RMSE): {rmse:.2f} K")
-        print(f"  Number of samples: {len(temperature_errors)}")
-        print(f"{'='*60}\n")
-        
-        # Save MSE to JSON file for animation script
-        mse_data = {
-            "target_temperature": float(target_temperature),
-            "mse": float(mse),
-            "rmse": float(rmse),
-            "num_samples": len(temperature_errors),
-            "controller_type": controller_type if controller_type else "none"
-        }
-        mse_file = Path(Nonmesh["save_path"]) / "mse_stats.json"
-        with open(mse_file, "w") as f:
-            json.dump(mse_data, f, indent=2)
-        print(f"MSE statistics saved to: {mse_file}")
-    else:
-        print("\nNo temperature control active - MSE not calculated.\n")
-
-    # Clear JAX caches
-    try:
-        stepGOMELT._clear_cache()
-        stepGOMELTDwellTime._clear_cache()
-        subcycleGOMELT._clear_cache()
-        moveEverything._clear_cache()
-        gc.collect()
-        # Cache cleared
-    except:
-        gc.collect()
-
-    print("\nSimulation completed.")
 
 
 if __name__ == "__main__":

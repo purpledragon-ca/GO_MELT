@@ -29,6 +29,91 @@ except ImportError:
 
 from go_melt_env import GoMeltEnv
 from observation_utils import print_observation_breakdown
+import gymnasium as gym
+
+
+class ObservationPrintingWrapper(gym.Wrapper):
+    """
+    Wrapper that prints observations at each step during training.
+    """
+    def __init__(self, env):
+        super().__init__(env)
+        self.step_num = 0
+        
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        self.step_num += 1
+        
+        # Get unwrapped environment for observation config
+        unwrapped = self.unwrapped if hasattr(self, 'unwrapped') else self.env
+        obs_config = unwrapped.observation_config if hasattr(unwrapped, 'observation_config') else {}
+        
+        # Handle action format (could be scalar or array)
+        action_str = f"{action[0]:.4f}" if hasattr(action, '__len__') and len(action) > 0 else f"{action:.4f}"
+        
+        print(f"\n{'='*60}")
+        print(f"Step {self.step_num}")
+        print(f"{'='*60}")
+        print(f"Action: {action_str} (normalized)")
+        print(f"Reward: {reward:.4f}")
+        
+        # Handle info dict (could be dict or array of dicts for vectorized)
+        if isinstance(info, dict):
+            temp_val = info.get('temperature', 'N/A')
+            power_val = info.get('power', 'N/A')
+            temp_str = f"{temp_val:.2f}K" if isinstance(temp_val, (int, float)) else str(temp_val)
+            power_str = f"{power_val:.2f}W" if isinstance(power_val, (int, float)) else str(power_val)
+            print(f"Temperature: {temp_str}")
+            print(f"Power: {power_str}")
+        else:
+            print(f"Temperature: {info}")
+            print(f"Power: {info}")
+        
+        print(f"Terminated: {terminated}, Truncated: {truncated}")
+        print(f"\nObservation:")
+        
+        toolpath_range = obs_config.get('toolpath_normalization_range', 10.0) if obs_config else 10.0
+        print_observation_breakdown(
+            observation=obs,
+            observation_config=obs_config,
+            history_length=unwrapped.observation_history_length if hasattr(unwrapped, 'observation_history_length') else 10,
+            power_min=unwrapped.power_min if hasattr(unwrapped, 'power_min') else 0.0,
+            power_max=unwrapped.power_max if hasattr(unwrapped, 'power_max') else 500.0,
+            temp_min=unwrapped.temp_min if hasattr(unwrapped, 'temp_min') else 0.0,
+            temp_max=unwrapped.temp_max if hasattr(unwrapped, 'temp_max') else 5000.0,
+            toolpath_normalization_range=toolpath_range,
+            prefix="  "
+        )
+        
+        return obs, reward, terminated, truncated, info
+    
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self.step_num = 0
+        
+        # Get unwrapped environment for observation config
+        unwrapped = self.unwrapped if hasattr(self, 'unwrapped') else self.env
+        obs_config = unwrapped.observation_config if hasattr(unwrapped, 'observation_config') else {}
+        
+        print(f"\n{'='*60}")
+        print(f"Environment Reset")
+        print(f"{'='*60}")
+        print(f"\nInitial Observation:")
+        
+        toolpath_range = obs_config.get('toolpath_normalization_range', 10.0) if obs_config else 10.0
+        print_observation_breakdown(
+            observation=obs,
+            observation_config=obs_config,
+            history_length=unwrapped.observation_history_length if hasattr(unwrapped, 'observation_history_length') else 10,
+            power_min=unwrapped.power_min if hasattr(unwrapped, 'power_min') else 0.0,
+            power_max=unwrapped.power_max if hasattr(unwrapped, 'power_max') else 500.0,
+            temp_min=unwrapped.temp_min if hasattr(unwrapped, 'temp_min') else 0.0,
+            temp_max=unwrapped.temp_max if hasattr(unwrapped, 'temp_max') else 5000.0,
+            toolpath_normalization_range=toolpath_range,
+            prefix="  "
+        )
+        
+        return obs, info
 
 
 def create_training_config(
@@ -138,6 +223,7 @@ def train_rl_agent(
             **env_kwargs
         )
         env = Monitor(env, str(output_path / "monitor"))
+        env = ObservationPrintingWrapper(env)
         return env
     
     # Validate environment before training
@@ -155,6 +241,7 @@ def train_rl_agent(
         # Print observation breakdown using shared utility
         obs_config = unwrapped_env.observation_config if hasattr(unwrapped_env, 'observation_config') else {}
         
+        toolpath_range = obs_config.get('toolpath_normalization_range', 10.0) if obs_config else 10.0
         print_observation_breakdown(
             observation=test_obs,
             observation_config=obs_config,
@@ -163,6 +250,7 @@ def train_rl_agent(
             power_max=unwrapped_env.power_max,
             temp_min=unwrapped_env.temp_min,
             temp_max=unwrapped_env.temp_max,
+            toolpath_normalization_range=toolpath_range,
             prefix="  "
         )
         

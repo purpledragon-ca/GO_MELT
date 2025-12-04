@@ -12,7 +12,9 @@ import os
 import sys
 import json
 import numpy as np
-from typing import Dict, Tuple, Optional, Any
+import tempfile
+import random
+from typing import Dict, Tuple, Optional, Any, List
 from pathlib import Path
 import gymnasium as gym
 from gymnasium import spaces
@@ -23,11 +25,44 @@ if _current_dir not in sys.path:
     sys.path.insert(0, _current_dir)
 
 try:
-    from controller import get_max_temperature_level3, RLController, get_observation as get_full_observation
+    from createPath import parsingGcode
 except ImportError:
-    RLController = None
-    get_max_temperature_level3 = None
-    get_full_observation = None
+    parsingGcode = None
+
+# Import GO-MELT simulation functions
+try:
+    from computeFunctions import (
+        SetupProperties, SetupLevels, SetupNonmesh,
+        getStaticNodesAndElements, getStaticSubcycle,
+        interpolatePointsMatrix, calcStaticTmpNodesAndElements,
+        stepGOMELT, moveEverything,
+        get_max_temperature_level3 as get_max_temp_L3,
+        getSubstrateNodes
+    )
+    import jax.numpy as jnp
+    HAS_GO_MELT = True
+except ImportError as e:
+    print(f"Warning: Could not import GO-MELT simulation functions: {e}")
+    HAS_GO_MELT = False
+    SetupProperties = None
+    SetupLevels = None
+    SetupNonmesh = None
+
+# Import reusable functions from go_melt.py
+try:
+    from go_melt import (
+        initialize_simulation_setup,
+        initialize_interpolation,
+        handle_layer_change
+    )
+    HAS_GO_MELT_HELPERS = True
+except ImportError as e:
+    print(f"Warning: Could not import GO-MELT helper functions from go_melt.py: {e}")
+    print("  Falling back to manual initialization.")
+    HAS_GO_MELT_HELPERS = False
+    initialize_simulation_setup = None
+    initialize_interpolation = None
+    handle_layer_change = None
 
 
 class GoMeltEnv(gym.Env):
@@ -147,14 +182,53 @@ class GoMeltEnv(gym.Env):
         
         # For storing simulation state
         self.levels = None
-        self.power_controller = None
+        
+        # GO-MELT simulation state (initialized in reset)
+        self.sim_properties = None
+        self.sim_nonmesh = None
+        self.sim_ne_nn = None
+        self.sim_subcycle = None
+        self.sim_shapes = None
+        self.sim_linterp = None
+        self.sim_tmp_ne_nn = None
+        self.sim_substrate = None
+        self.sim_laser_prev_z = None
+        self.sim_move_hist = None
+        self.sim_time_inc = 0
+        self.sim_toolpath_file = None
+        self.sim_toolpath_file_path = None
+        self.toolpath_file_path = None  # Path to the generated toolpath file (keep for simulation)
+        # Mesh ratios for movement logic (stored to avoid recalculation)
+        self.sim_L1L2Eratio = None
+        self.sim_L2L3Eratio = None
         
         # History tracking for observations
         self.power_history = []
         self.temperature_history = []
-        self.toolpath_history = []  # For toolpath history if enabled
-        self.toolpath_future = []  # For future toolpath if enabled
-        self.power_history_toolpath = []  # Power history for toolpath
+        
+        # Load toolpath from gcode file using createPath logic
+        # This creates a consistent path list that will be followed in order
+        self.toolpath_list = self._generate_toolpath_list()
+        self.toolpath_position = 0  # Current position index in toolpath_list (0 to len-1)
+        self.toolpath_completed = False  # Track if we've completed the full path
+        
+        # Load toolpath_step_size and N23 from config
+        if "nonmesh" in self.solver_input:
+            nonmesh = self.solver_input["nonmesh"]
+            laser_velocity = nonmesh.get("laser_velocity", 1000.0)  # mm/s
+            timestep_L3 = nonmesh.get("timestep_L3", 1e-5)  # seconds
+            self.toolpath_step_size = laser_velocity * timestep_L3  # mm per step
+            
+            # Calculate N23 = subcycle_num_L2 * subcycle_num_L3
+            subcycle_num_L2 = nonmesh.get("subcycle_num_L2", 1)
+            subcycle_num_L3 = nonmesh.get("subcycle_num_L3", 1)
+            self.N23 = subcycle_num_L2 * subcycle_num_L3
+        else:
+            self.toolpath_step_size = 0.1  # Default: 0.1 mm per step
+            self.N23 = 1  # Default: 1
+        
+        print(f"Initialized toolpath with {len(self.toolpath_list)} points")
+        print(f"  N23 (step spacing): {self.N23}")
         
         # Define action and observation spaces
         # Action: normalized power adjustment [-1, 1] -> maps to power range
@@ -197,23 +271,383 @@ class GoMeltEnv(gym.Env):
     def _denormalize_power(self, norm_power: float) -> float:
         """Denormalize power from [0, 1] range."""
         return norm_power * (self.power_max - self.power_min) + self.power_min
+    #checked
+    def _generate_toolpath_list(self) -> List[np.ndarray]:
+        """
+        Generate full toolpath list from gcode file using createPath.parsingGcode.
+        This creates an interpolated toolpath with points spaced by toolpath_step_size.
+        
+        Returns:
+        --------
+        List[np.ndarray]
+            List of toolpath points as numpy arrays [x, y, z]
+        """
+        # Get config parameters
+        nonmesh = self.solver_input.get("nonmesh", {})
+        properties = self.solver_input.get("properties", {})
+        gcode_path = nonmesh.get("gcode")
+        
+        # Create temporary gcode file if needed
+        tmp_gcode_path = None
+        if not gcode_path or not os.path.exists(gcode_path):
+            # Create a temporary gcode file with default pattern
+            random_X_Start = np.random.uniform(0.0, 10.0)
+            random_X_End = np.random.uniform(0.0, 10.0)
+            Y = 0.0
+            Z= 0.04
+            repeat_times = random.randint(2, 10)
+
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.gcode') as tmp_gcode_file:
+                tmp_gcode_path = tmp_gcode_file.name
+                # Write default pattern: (2.0, 2.0, 0.04) -> (8.0, 2.0, 0.04) -> repeat
+                tmp_gcode_file.write(f"G0 X{random_X_Start} Y{Y} Z{Z}\n")
+                for i in range(repeat_times):
+                    tmp_gcode_file.write(f"G1 X{random_X_End} Y{Y} Z{Z}\n")
+                    tmp_gcode_file.write(f"G1 X{random_X_Start} Y{Y} Z{Z}\n")   
+            print(f"Created temporary gcode file with default pattern: {tmp_gcode_path}")
+            gcode_path = tmp_gcode_path
+        
+        # Use createPath.parsingGcode to generate toolpath
+        try:
+            # Create a temporary toolpath file
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as tmp_file:
+                tmp_toolpath = tmp_file.name
+            
+            # Create a temporary nonmesh config for parsingGcode
+            tmp_nonmesh = nonmesh.copy()
+            tmp_nonmesh["toolpath"] = tmp_toolpath
+            tmp_nonmesh["gcode"] = gcode_path  # Use the gcode path (original or temp)
+            
+            # L2h is not used in parsingGcode, so we can pass a dummy value
+            # (it's only used in the actual simulation, not in path generation)
+            dummy_L2h = 0.0
+            
+            # Generate toolpath using createPath
+            parsingGcode(tmp_nonmesh, properties, dummy_L2h)
+            
+            # Read the generated toolpath file
+            toolpath_list = []
+            with open(tmp_toolpath, 'r') as f:
+                for line in f:
+                    parts = line.strip().split(',')
+                    if len(parts) >= 3:
+                        x = float(parts[0])
+                        y = float(parts[1])
+                        z = float(parts[2])
+                        toolpath_list.append(np.array([x, y, z], dtype=np.float32))
+            
+            # Keep the toolpath file for simulation (don't delete it)
+            self.toolpath_file_path = tmp_toolpath
+            
+            # Clean up temporary gcode file if we created it
+            if tmp_gcode_path:
+                try:
+                    os.unlink(tmp_gcode_path)
+                except:
+                    pass
+            
+            if len(toolpath_list) > 0:
+                print(f"Generated {len(toolpath_list)} toolpath points using createPath.parsingGcode")
+                print(f"Toolpath file saved at: {self.toolpath_file_path}")
+                return toolpath_list
+            else:
+                raise ValueError("parsingGcode generated empty toolpath")
+                
+        except Exception as e:
+            print(f"Warning: Failed to use createPath.parsingGcode: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Clean up temporary gcode file if created
+            if tmp_gcode_path:
+                try:
+                    os.unlink(tmp_gcode_path)
+                except:
+                    pass
+            
+            # Fallback: return empty list (should not happen, but handle gracefully)
+            print("Error: Could not generate toolpath. Returning empty list.")
+            exit()
+    #checked
+    def _get_current_toolpath_position(self) -> np.ndarray:
+        """
+        Get current toolpath position using index.
+        Returns the actual position from the path list (no wrapping).
+        
+        Returns:
+        --------
+        np.ndarray
+            Current position [x, y, z] in mm
+        """
+        if len(self.toolpath_list) == 0:
+            return np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        
+        # Clamp to valid range (don't wrap)
+        idx = min(self.toolpath_position, len(self.toolpath_list) - 1)
+        return self.toolpath_list[idx].copy()
+    #checked
+    def _get_future_toolpath(self, length: int) -> np.ndarray:
+        """
+        Get future toolpath points relative to current position using indices.
+        
+        Parameters:
+        -----------
+        length : int
+            Number of points to return
+            
+        Returns:
+        --------
+        np.ndarray
+            Array of shape (length, 3) with relative positions [x, y, z] in mm
+        """
+        if len(self.toolpath_list) == 0:
+            return np.zeros((length, 3), dtype=np.float32)
+        
+        current_pos = self._get_current_toolpath_position()
+        future_points = []
+        
+        # Space points by N23 from config
+        step_spacing = self.N23
+        
+        for i in range(length):
+            # Calculate future index (don't wrap, clamp to end of path)
+            future_idx = min(self.toolpath_position + (i + 1) * step_spacing, len(self.toolpath_list) - 1)
+            future_pos = self.toolpath_list[future_idx]
+            # Return relative to current position
+            relative_pos = future_pos - current_pos
+            future_points.append(relative_pos)
+        
+        return np.array(future_points, dtype=np.float32)   
+    #checked
+    def _get_history_toolpath(self, length: int) -> np.ndarray:
+        """
+        Get history toolpath points relative to current position using indices.
+        
+        Parameters:
+        -----------
+        length : int
+            Number of points to return
+            
+        Returns:
+        --------
+        np.ndarray
+            Array of shape (length, 3) with relative positions [x, y, z] in mm
+        """
+        if len(self.toolpath_list) == 0:
+            return np.zeros((length, 3), dtype=np.float32)
+        
+        current_pos = self._get_current_toolpath_position()
+        history_points = []
+        
+        # Space points by N23 from config
+        step_spacing = self.N23
+        
+        for i in range(length):
+            # Calculate past index (clamp to 0, don't wrap)
+            past_idx = max(0, self.toolpath_position - (i + 1) * step_spacing)
+            past_pos = self.toolpath_list[past_idx]
+            
+            # Return relative to current position
+            relative_pos = past_pos - current_pos
+            history_points.append(relative_pos)
+        
+        # Reverse so oldest is first
+        history_points.reverse()
+        return np.array(history_points, dtype=np.float32)
     
-    def _create_mock_levels(self, temperature: float) -> Dict:
+    def _initialize_simulation(self):
         """
-        Create a mock Levels structure for use with get_observation.
-        
-        This is needed because the simplified training environment doesn't run
-        actual simulations, but the full observation function expects Levels data.
+        Initialize the real GO-MELT simulation state.
+        This sets up Levels, Properties, Nonmesh, and all necessary structures.
+        Uses reusable functions from go_melt.py when available.
         """
-        # Create a simple mock temperature field
-        # For training, we just need the max temperature, so we create a minimal structure
-        mock_temp_field = np.array([[temperature]], dtype=np.float32)
+        if not HAS_GO_MELT:
+            print("Warning: GO-MELT simulation functions not available. Using mock simulation.")
+            return False
         
-        return {
-            3: {
-                "T0": mock_temp_field
-            }
-        }
+        try:
+            # Use reusable initialization function if available, otherwise fallback
+            if HAS_GO_MELT_HELPERS and initialize_simulation_setup is not None:
+                # Use refactored initialization function
+                Properties, Levels, Nonmesh, ne_nn, subcycle, L1L2Eratio, L2L3Eratio = initialize_simulation_setup(self.solver_input)
+                
+                self.sim_properties = Properties
+                self.sim_nonmesh = Nonmesh
+                self.levels = Levels
+                self.sim_ne_nn = ne_nn
+                self.sim_subcycle = subcycle
+                self.sim_L1L2Eratio = L1L2Eratio
+                self.sim_L2L3Eratio = L2L3Eratio
+                
+                # Use reusable interpolation function
+                self.sim_linterp = initialize_interpolation(self.levels) if initialize_interpolation is not None else None
+            else:
+                # Fallback to manual initialization if helpers not available
+                self.sim_properties = SetupProperties(self.solver_input.get("properties", {}))
+                self.sim_nonmesh = SetupNonmesh(self.solver_input.get("nonmesh", {}))
+                self.levels = SetupLevels(self.solver_input, self.sim_properties)
+                self.sim_ne_nn = getStaticNodesAndElements(self.levels)
+                self.sim_subcycle = getStaticSubcycle(self.sim_nonmesh)
+                
+                # Calculate mesh ratios manually
+                self.sim_L1L2Eratio = [
+                    int(jnp.round(self.levels[1]["h"][i] / self.levels[2]["h"][i])) for i in range(2)
+                ] + [int(jnp.round(self.sim_properties["layer_height"] / self.levels[2]["h"][2]))]
+                self.sim_L2L3Eratio = [
+                    int(jnp.round(self.levels[2]["h"][i] / self.levels[3]["h"][i])) for i in range(3)
+                ]
+            
+            # Initialize interpolation if not already done
+            if self.sim_linterp is None:
+                L1L2Interp = interpolatePointsMatrix(self.levels[1], self.levels[2]["node_coords"])
+                L2L3Interp = interpolatePointsMatrix(self.levels[2], self.levels[3]["node_coords"])
+                self.sim_linterp = [L1L2Interp, L2L3Interp]
+            
+            # Initialize Shapes (will be set by moveEverything)
+            self.sim_shapes = None
+            
+            # Initialize substrate using getSubstrateNodes
+            self.sim_substrate = getSubstrateNodes(self.levels)
+            
+            # Initialize tracking variables
+            self.sim_laser_prev_z = float("inf")
+            self.sim_move_hist = [jnp.array(0), jnp.array(0), jnp.array(0)]
+            self.sim_time_inc = 0
+            
+            # Use the toolpath file generated by _generate_toolpath_list
+            # Update nonmesh to point to the generated toolpath file
+            if self.toolpath_file_path and os.path.exists(self.toolpath_file_path):
+                self.sim_nonmesh["toolpath"] = self.toolpath_file_path
+                self.sim_toolpath_file_path = self.toolpath_file_path
+                self.sim_toolpath_file = open(self.sim_toolpath_file_path, "r")
+            elif self.sim_nonmesh.get("toolpath"):
+                # Fallback to original toolpath path
+                self.sim_toolpath_file_path = self.sim_nonmesh["toolpath"]
+                if os.path.exists(self.sim_toolpath_file_path):
+                    self.sim_toolpath_file = open(self.sim_toolpath_file_path, "r")
+                else:
+                    print(f"Warning: Toolpath file not found: {self.sim_toolpath_file_path}")
+                    return False
+            else:
+                print("Warning: No toolpath file available for simulation")
+                return False
+            
+            print("✓ GO-MELT simulation initialized successfully")
+            return True
+            
+        except Exception as e:
+            print(f"Warning: Failed to initialize GO-MELT simulation: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def _run_simulation_step(self, laser_position: np.ndarray, laser_power: float) -> Optional[float]:
+        """
+        Run a single step of the GO-MELT simulation.
+        
+        Parameters:
+        -----------
+        laser_position : np.ndarray
+            Current laser position [x, y, z, jump, dwell, dt, power]
+        laser_power : float
+            Current laser power in Watts
+            
+        Returns:
+        --------
+        float or None
+            Maximum temperature in Level 3, or None if simulation failed
+        """
+        if not HAS_GO_MELT or self.levels is None:
+            return None
+        
+        try:
+            # Convert laser position to JAX array format
+            # Format: [x, y, z, jump, dwell, dt, power]
+            dt = self.sim_nonmesh.get("timestep_L3", 1e-5)
+            laser_pos_jax = jnp.array([
+                float(laser_position[0]),  # x
+                float(laser_position[1]),  # y
+                float(laser_position[2]),  # z
+                1.0,  # jump (1 = normal move, 0 = jump)
+                1.0,  # dwell (1 = normal, 0 = dwell)
+                dt,   # timestep
+                laser_power  # power
+            ], dtype=jnp.float32)
+            
+            # Track if layer change was handled
+            layer_changed = False
+            
+            # Handle layer changes if needed
+            if laser_pos_jax[2] != self.sim_laser_prev_z:
+                layer_changed = True
+                # Use reusable layer change handler if available
+                if HAS_GO_MELT_HELPERS and handle_layer_change is not None:
+                    # Use handle_layer_change for proper layer handling
+                    # Note: We pass None for accum_time/max_accum_time since environment doesn't track these
+                    self.sim_linterp, self.sim_tmp_ne_nn, self.sim_laser_prev_z, _, _, _, _, _ = handle_layer_change(
+                        laser_pos_jax, self.sim_laser_prev_z, self.levels, self.sim_properties,
+                        self.sim_linterp, self.sim_nonmesh, False, False, None, None
+                    )
+                else:
+                    # Fallback: just update the previous z
+                    self.sim_laser_prev_z = laser_pos_jax[2]
+            
+            # Move meshes if needed (first time or layer change)
+            if self.sim_shapes is None or layer_changed:
+                # Get initial laser position
+                laser_start = jnp.array([
+                    float(laser_position[0]),
+                    float(laser_position[1]),
+                    float(laser_position[2]),
+                    0.0, 0.0, 0.0, 0.0
+                ], dtype=jnp.float32)
+                
+                # Move meshes using stored ratios (always set during initialization)
+                (self.levels, self.sim_shapes, self.sim_linterp, self.sim_move_hist) = moveEverything(
+                    laser_pos_jax,
+                    laser_start,
+                    self.levels,
+                    self.sim_move_hist,
+                    self.sim_linterp,
+                    self.sim_L1L2Eratio,
+                    self.sim_L2L3Eratio,
+                    self.sim_properties["layer_height"],
+                )
+                
+                # Update tmp_ne_nn if not already updated by handle_layer_change
+                if not (layer_changed and HAS_GO_MELT_HELPERS and handle_layer_change is not None):
+                    self.sim_tmp_ne_nn = calcStaticTmpNodesAndElements(self.levels, laser_pos_jax)
+            
+            # Run simulation step
+            # Always use stepGOMELT for single step (subcycle would need multiple positions)
+            self.levels, _ = stepGOMELT(
+                self.levels,
+                self.sim_ne_nn,
+                self.sim_tmp_ne_nn,
+                self.sim_shapes,
+                self.sim_linterp,
+                laser_pos_jax[:3],  # position only [x, y, z]
+                self.sim_properties,
+                dt,
+                laser_power,
+                self.sim_substrate
+            )
+            
+            # Get maximum temperature from Level 3
+            if get_max_temp_L3 is not None:
+                max_temp = float(get_max_temp_L3(self.levels))
+            else:
+                # Fallback: get max from T0 array
+                max_temp = float(jnp.max(self.levels[3]["T0"]))
+            
+            self.sim_time_inc += 1
+            return max_temp
+            
+        except Exception as e:
+            print(f"Warning: Simulation step failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
     
     def _calculate_observation_size(self) -> int:
         """
@@ -360,17 +794,29 @@ class GoMeltEnv(gym.Env):
                     norm_temp_hist.insert(0, 0.0)
                 obs_list.extend(norm_temp_hist[:temp_hist_len])
             
-            # Future toolpath (not available in simplified env)
+            # Future toolpath (relative positions, normalized within config range)
             if self.observation_config.get('enable_future_toolpath', False):
                 future_toolpath_len = self.observation_config.get('future_toolpath_length', 10)
-                # Pad with zeros (3 values per point: x, y, z)
-                obs_list.extend([0.0] * (future_toolpath_len * 3))
+                future_path = self._get_future_toolpath(future_toolpath_len)  # Already relative to current position
+                # Normalize relative path within config-defined range
+                toolpath_range = self.observation_config.get('toolpath_normalization_range', 10.0)  # Default: ±10mm
+                future_path_flat = future_path.flatten()
+                # Normalize: divide by range, clip to [-1, 1], then convert to [0, 1]
+                normalized = np.clip(future_path_flat / toolpath_range, -1.0, 1.0)
+                normalized = (normalized + 1.0) / 2.0  # Convert to [0, 1]
+                obs_list.extend(normalized.tolist())
             
-            # History toolpath (not available in simplified env)
+            # History toolpath (relative positions, normalized within config range)
             if self.observation_config.get('enable_history_toolpath', False):
                 history_toolpath_len = self.observation_config.get('history_toolpath_length', 10)
-                # Pad with zeros (3 values per point: x, y, z)
-                obs_list.extend([0.0] * (history_toolpath_len * 3))
+                hist_path = self._get_history_toolpath(history_toolpath_len)  # Already relative to current position
+                # Normalize relative path within config-defined range
+                toolpath_range = self.observation_config.get('toolpath_normalization_range', 10.0)  # Default: ±10mm
+                hist_path_flat = hist_path.flatten()
+                # Normalize: divide by range, clip to [-1, 1], then convert to [0, 1]
+                normalized = np.clip(hist_path_flat / toolpath_range, -1.0, 1.0)
+                normalized = (normalized + 1.0) / 2.0  # Convert to [0, 1]
+                obs_list.extend(normalized.tolist())
         
         # If no config or empty list, fall back to simple observation format
         if not obs_list:
@@ -462,16 +908,44 @@ class GoMeltEnv(gym.Env):
         self.power_history.clear()
         self.temperature_history.clear()
         
-        # Reset temperature state
-        # Add some randomness to initial temperature for exploration
-        initial_temp_ratio = 0.85 + np.random.uniform(0, 0.15)  # 85-100% of target
-        self._current_temp = self.target_temperature * initial_temp_ratio
+        # Reset toolpath position and completion flag
+        self.toolpath_position = 0
+        self.toolpath_completed = False
+        
+        # Close existing toolpath file if open
+        if self.sim_toolpath_file is not None:
+            try:
+                self.sim_toolpath_file.close()
+            except:
+                pass
+            self.sim_toolpath_file = None
+        
+        # Initialize or reinitialize GO-MELT simulation
+        if not self._initialize_simulation():
+            # Fallback to mock if simulation initialization fails
+            initial_temp_ratio = 0.85 + np.random.uniform(0, 0.15)
+            self._current_temp = self.target_temperature * initial_temp_ratio
+            initial_temp = self._current_temp
+        else:
+            # Get initial temperature from simulation
+            if len(self.toolpath_list) > 0:
+                initial_laser_pos = self.toolpath_list[0]
+                initial_temp = self._run_simulation_step(initial_laser_pos, self.current_power)
+                if initial_temp is None:
+                    # Fallback if simulation step fails
+                    initial_temp_ratio = 0.85 + np.random.uniform(0, 0.15)
+                    self._current_temp = self.target_temperature * initial_temp_ratio
+                    initial_temp = self._current_temp
+                else:
+                    self._current_temp = initial_temp
+            else:
+                initial_temp = self.target_temperature * 0.9
+                self._current_temp = initial_temp
         
         # Reset power controller in config
         self.solver_input["power_controller"]["controller_params"]["base_power"] = self.base_power
         
         # Get initial observation with history (all zeros for history initially)
-        initial_temp = self._current_temp
         observation = self._get_observation(initial_temp, self.current_power)
         self._last_obs = observation
         
@@ -515,36 +989,47 @@ class GoMeltEnv(gym.Env):
         new_power = self._action_to_power(action)
         self.current_power = new_power
         
-        # Simplified temperature dynamics model
-        # This models the relationship between power and temperature
-        # In a real implementation, this would come from the actual simulation
+        # Get current toolpath position before advancing
+        if len(self.toolpath_list) > 0 and self.toolpath_position < len(self.toolpath_list):
+            current_laser_pos = self.toolpath_list[self.toolpath_position]
+        else:
+            # Fallback if no toolpath
+            current_laser_pos = np.array([0.0, 0.0, 0.04], dtype=np.float32)
         
-        # More stable temperature dynamics model
-        # Temperature response to power: T ∝ P^α where α ≈ 0.5-0.7 for thermal systems
-        power_ratio = self.current_power / self.base_power if self.base_power > 0 else 1.0
+        # Run real GO-MELT simulation step
+        current_temp = self._run_simulation_step(current_laser_pos, self.current_power)
         
-        # Model temperature response with some dynamics
-        if not hasattr(self, '_current_temp'):
-            self._current_temp = self.target_temperature * 0.9
+        # Fallback to mock if simulation fails
+        if current_temp is None:
+            # Simplified temperature dynamics model (fallback)
+            power_ratio = self.current_power / self.base_power if self.base_power > 0 else 1.0
+            
+            if not hasattr(self, '_current_temp'):
+                self._current_temp = self.target_temperature * 0.9
+            
+            alpha = 0.6
+            target_temp_from_power = self.target_temperature * (power_ratio ** alpha)
+            time_constant = 0.05
+            temp_change = (target_temp_from_power - self._current_temp) * time_constant
+            self._current_temp += temp_change
+            self._current_temp = np.clip(self._current_temp, 500.0, 5000.0)
+            
+            noise = np.random.normal(0, 5.0)
+            current_temp = self._current_temp + noise
+            current_temp = np.clip(current_temp, 500.0, 5000.0)
+        else:
+            # Update tracked temperature from real simulation
+            self._current_temp = current_temp
         
-        # Target temperature based on power (non-linear relationship)
-        # Use power law: T_target = T_base * (P/P_base)^alpha
-        alpha = 0.6  # Power law exponent (typical for thermal systems)
-        target_temp_from_power = self.target_temperature * (power_ratio ** alpha)
-        
-        # First-order response: temp moves toward target with time constant
-        # Use smaller time constant for stability
-        time_constant = 0.05  # Reduced from 0.1 for more stable dynamics
-        temp_change = (target_temp_from_power - self._current_temp) * time_constant
-        self._current_temp += temp_change
-        
-        # Clamp temperature to reasonable range to prevent instability
-        self._current_temp = np.clip(self._current_temp, 500.0, 5000.0)
-        
-        # Add small noise for realism (reduced from 10K)
-        noise = np.random.normal(0, 5.0)  # 5K noise
-        current_temp = self._current_temp + noise
-        current_temp = np.clip(current_temp, 500.0, 5000.0)
+        # Advance toolpath position (follow path in order, don't wrap)
+        if len(self.toolpath_list) > 0:
+            self.toolpath_position += 1
+            # Check if we've completed the full path
+            if self.toolpath_position >= len(self.toolpath_list):
+                self.toolpath_completed = True
+                self.toolpath_position = len(self.toolpath_list) - 1  # Keep at last position
+        else:
+            self.toolpath_position += 1
         
         # Update history (before getting observation)
         self.power_history.append(self.current_power)
@@ -561,20 +1046,31 @@ class GoMeltEnv(gym.Env):
         self.step_count += 1
         
         # Check termination conditions
-        # If max_steps is None, use a default long episode length for training
-        # This prevents episodes from running indefinitely
-        effective_max_steps = self.max_steps if self.max_steps is not None else 10000
-        
-        if self.step_count >= effective_max_steps:
+        # Terminate when we've completed the full toolpath
+        if self.toolpath_completed:
             terminated = True
+            truncated = False
+        elif self.max_steps is not None and self.step_count >= self.max_steps:
+            # Also check max_steps if specified
+            terminated = False
             truncated = True
         else:
+            # Continue following the path
             terminated = self.simulation_complete
             truncated = False
+        
+        # Get current toolpath position for info
+        current_toolpath_pos = None
+        if len(self.toolpath_list) > 0 and self.toolpath_position < len(self.toolpath_list):
+            current_toolpath_pos = self.toolpath_list[self.toolpath_position]
         
         info = {
             "temperature": float(current_temp),
             "power": float(self.current_power),
+            "toolpath_position": int(self.toolpath_position),
+            "toolpath_progress": float(self.toolpath_position / len(self.toolpath_list)) if len(self.toolpath_list) > 0 else 0.0,
+            "toolpath_completed": self.toolpath_completed,
+            "current_toolpath_point": current_toolpath_pos.tolist() if current_toolpath_pos is not None else None,
             "episode": {
                 "r": self.episode_reward,
                 "l": self.episode_length
@@ -591,5 +1087,20 @@ class GoMeltEnv(gym.Env):
     
     def close(self):
         """Clean up environment resources."""
-        pass
+        # Close toolpath file if open
+        if self.sim_toolpath_file is not None:
+            try:
+                self.sim_toolpath_file.close()
+            except:
+                pass
+            self.sim_toolpath_file = None
+        
+        # Clean up temporary toolpath file if we created it
+        if self.toolpath_file_path and os.path.exists(self.toolpath_file_path):
+            # Check if it's a temporary file (in temp directory)
+            if tempfile.gettempdir() in self.toolpath_file_path:
+                try:
+                    os.unlink(self.toolpath_file_path)
+                except:
+                    pass
 

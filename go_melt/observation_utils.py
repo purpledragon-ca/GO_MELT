@@ -17,6 +17,7 @@ def print_observation_breakdown(
     power_max: float = 500.0,
     temp_min: float = 0.0,
     temp_max: float = 5000.0,
+    toolpath_normalization_range: float = 10.0,
     prefix: str = "  "
 ) -> None:
     """
@@ -42,6 +43,8 @@ def print_observation_breakdown(
         Minimum temperature for denormalization. Default: 0.0
     temp_max : float
         Maximum temperature for denormalization. Default: 5000.0
+    toolpath_normalization_range : float
+        Range for toolpath normalization (relative positions in mm). Default: 10.0
     prefix : str
         Prefix string for each printed line (for indentation). Default: "  "
     """
@@ -158,7 +161,23 @@ def print_observation_breakdown(
         expected_size = future_toolpath_len * 3
         actual_size = min(expected_size, len(obs_flat) - idx)
         if actual_size > 0:
-            print(f"{prefix}  Future Toolpath (indices {idx}-{idx+actual_size-1}): {actual_size//3} points (x,y,z each, actual: {actual_size} values)")
+            num_points = actual_size // 3
+            print(f"{prefix}  Future Toolpath (indices {idx}-{idx+actual_size-1}): {num_points} points (x,y,z each, actual: {actual_size} values)")
+            for i in range(num_points):
+                x_idx = idx + i * 3
+                y_idx = idx + i * 3 + 1
+                z_idx = idx + i * 3 + 2
+                if x_idx < len(obs_flat) and y_idx < len(obs_flat) and z_idx < len(obs_flat):
+                    x_norm = obs_flat[x_idx]
+                    y_norm = obs_flat[y_idx]
+                    z_norm = obs_flat[z_idx]
+                    # Denormalize: (normalized * 2.0 - 1.0) * range = relative position in mm
+                    # Get range from config if available, otherwise use default
+                    toolpath_range = obs_config.get('toolpath_normalization_range', toolpath_normalization_range)
+                    x_actual = (x_norm * 2.0 - 1.0) * toolpath_range
+                    y_actual = (y_norm * 2.0 - 1.0) * toolpath_range
+                    z_actual = (z_norm * 2.0 - 1.0) * toolpath_range
+                    print(f"{prefix}    Point[{i}]: x={x_norm:.6f} -> {x_actual:.3f}mm, y={y_norm:.6f} -> {y_actual:.3f}mm, z={z_norm:.6f} -> {z_actual:.3f}mm")
             idx += actual_size
         else:
             print(f"{prefix}  Future Toolpath: Not available (expected {expected_size} values)")
@@ -169,7 +188,23 @@ def print_observation_breakdown(
         expected_size = history_toolpath_len * 3
         actual_size = min(expected_size, len(obs_flat) - idx)
         if actual_size > 0:
-            print(f"{prefix}  History Toolpath (indices {idx}-{idx+actual_size-1}): {actual_size//3} points (x,y,z each, actual: {actual_size} values)")
+            num_points = actual_size // 3
+            print(f"{prefix}  History Toolpath (indices {idx}-{idx+actual_size-1}): {num_points} points (x,y,z each, actual: {actual_size} values)")
+            for i in range(num_points):
+                x_idx = idx + i * 3
+                y_idx = idx + i * 3 + 1
+                z_idx = idx + i * 3 + 2
+                if x_idx < len(obs_flat) and y_idx < len(obs_flat) and z_idx < len(obs_flat):
+                    x_norm = obs_flat[x_idx]
+                    y_norm = obs_flat[y_idx]
+                    z_norm = obs_flat[z_idx]
+                    # Denormalize: (normalized * 2.0 - 1.0) * range = relative position in mm
+                    # Get range from config if available, otherwise use default
+                    toolpath_range = obs_config.get('toolpath_normalization_range', toolpath_normalization_range)
+                    x_actual = (x_norm * 2.0 - 1.0) * toolpath_range
+                    y_actual = (y_norm * 2.0 - 1.0) * toolpath_range
+                    z_actual = (z_norm * 2.0 - 1.0) * toolpath_range
+                    print(f"{prefix}    Point[{i}]: x={x_norm:.6f} -> {x_actual:.3f}mm, y={y_norm:.6f} -> {y_actual:.3f}mm, z={z_norm:.6f} -> {z_actual:.3f}mm")
             idx += actual_size
         else:
             print(f"{prefix}  History Toolpath: Not available (expected {expected_size} values)")
