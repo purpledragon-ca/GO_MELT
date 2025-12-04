@@ -14,9 +14,9 @@ Usage:
     
 Examples:
     python gif_creator.py                          # Auto-detect latest results
-    python gif_creator.py results/example/         # Use specific directory
+    python gif_creator.py results/config/         # Use specific directory
     python gif_creator.py --level 3 --output my_animation.gif  # Auto-detect with options
-    python gif_creator.py results/example/ --overview --output overview.gif
+    python gif_creator.py results/config/ --overview --output overview.gif
 """
 
 import argparse

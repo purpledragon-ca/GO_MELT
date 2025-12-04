@@ -9,8 +9,15 @@ import dill
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+# Use absolute imports - add current directory to path if needed
+_current_dir = os.path.dirname(os.path.abspath(__file__))
+if _current_dir not in sys.path:
+    sys.path.insert(0, _current_dir)
+
 from computeFunctions import *
 from createPath import parsingGcode, count_lines
+
 import gc
 import json
 from datetime import datetime
@@ -25,7 +32,7 @@ class GoMeltSimulator:
     For each step, it will require a power input.
     """
     
-    def __init__(self, solver_input: dict, input_file: str = None):
+    def __init__(self, solver_input: dict, input_file: str = None, verbose: bool = True):
         """
         Initialize the simulator with configuration.
         
@@ -35,10 +42,13 @@ class GoMeltSimulator:
             Complete simulation configuration dictionary
         input_file : str | None
             Path to input JSON file (optional, for output naming)
+        verbose : bool
+            Whether to print step details. Default: True
         """
         # Store configuration
         self.solver_input = solver_input
         self.input_file = input_file
+        self.verbose = verbose
         
         # Initialize all components
         self._initialize_simulation_setup()
@@ -510,12 +520,15 @@ class GoMeltSimulator:
             self.savenum = int(self.time_inc / self.Nonmesh["record_step"]) + 1
             saveResults(self.Levels, self.Nonmesh, self.savenum, power=power)
         
-        # Print status
-        max_temp_L3 = float(jnp.max(self.Levels[3]["T0"]))
-        print(f"Step {self.time_inc:6d}/{self.total_t_inc} | "
-              f"Max Temp: {max_temp_L3:7.2f} K | "
-              f"Power: {power:6.2f} W | "
-              f"Location: X:{laser_pos[0]:6.2f} Y:{laser_pos[1]:6.2f} Z:{laser_pos[2]:6.2f}")
+        # Print status (only if verbose)
+        if self.verbose:
+            max_temp_L3 = float(jnp.max(self.Levels[3]["T0"]))
+            # if max_temp_L3 <300:
+                # import pdb; pdb.set_trace()
+            print(f"Step {self.time_inc:6d}/{self.total_t_inc} | "
+                  f"Max Temp: {max_temp_L3:7.2f} K | "
+                  f"Power: {power:6.2f} W | "
+                  f"Location: X:{laser_pos[0]:6.2f} Y:{laser_pos[1]:6.2f} Z:{laser_pos[2]:6.2f}")
         
         return self.ongoing_simulation
     
@@ -622,7 +635,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python simulator.py 0 examples/example.json
+  python simulator.py 0 config/example.json
         """
     )
     
@@ -638,8 +651,8 @@ Examples:
         "input_file",
         type=str,
         nargs="?",
-        default="examples/example.json",
-        help="Path to input JSON configuration file (default: examples/example.json)"
+        default="config/example.json",
+        help="Path to input JSON configuration file (default: config/example.json)"
     )
     
     args = parser.parse_args()

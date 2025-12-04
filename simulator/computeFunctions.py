@@ -403,7 +403,7 @@ def SetupNonmesh(nonmesh_input):
 
     # G-code file path
     Nonmesh.gcode = nonmesh_input.get(
-        "gcode", "./examples/gcodefiles/defaultName.gcode"
+        "gcode", "./config/gcodefiles/defaultName.gcode"
     )
 
     # Dwell time multiplier (unitless)
