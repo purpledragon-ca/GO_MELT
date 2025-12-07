@@ -26,44 +26,29 @@ if _parent_dir not in sys.path:
     sys.path.insert(0, _parent_dir)
 
 # Import GoMeltSimulator
-try:
-    from simulator.simulator import GoMeltSimulator
-    HAS_SIMULATOR = True
-except ImportError as e:
-    print(f"Warning: Could not import GoMeltSimulator: {e}")
-    HAS_SIMULATOR = False
-    GoMeltSimulator = None
+from simulator.simulator import GoMeltSimulator
 
-try:
-    import jax.numpy as jnp
-    HAS_JAX = True
-except ImportError:
-    HAS_JAX = False
-    jnp = None
+# Import JAX
+import jax.numpy as jnp
 
-# Import functions from controller (for backward compatibility and direct access)
-try:
-    from controller import (
-        get_max_temperature_level3, 
-        get_fraction_above_liquidus,
-        get_accum_time_local,
-        get_laser_speed,
-        get_distance_to_last_point,
-        get_temperature_stats_level3
-    )
-    get_max_temp_L3 = get_max_temperature_level3
-    get_frac_above_liquidus = get_fraction_above_liquidus
-    get_accum_time_local_func = get_accum_time_local
-    get_laser_speed_func = get_laser_speed
-    get_distance_to_last_point_func = get_distance_to_last_point
-    get_temperature_stats_L3 = get_temperature_stats_level3
-except ImportError:
-    get_max_temp_L3 = None
-    get_frac_above_liquidus = None
-    get_accum_time_local_func = None
-    get_laser_speed_func = None
-    get_distance_to_last_point_func = None
-    get_temperature_stats_L3 = None
+# Import functions from controller
+from controller import (
+    get_max_temperature_level3, 
+    get_fraction_above_liquidus,
+    get_laser_speed,
+    get_distance_to_last_point,
+    get_temperature_stats_level3
+)
+
+# Aliases for backward compatibility
+get_max_temp_L3 = get_max_temperature_level3
+get_frac_above_liquidus = get_fraction_above_liquidus
+get_laser_speed_func = get_laser_speed
+get_distance_to_last_point_func = get_distance_to_last_point
+get_temperature_stats_L3 = get_temperature_stats_level3
+
+# Import reward computation function
+from rl_model.reward import compute_reward
 
 # Import observation utilities (from same directory)
 # Use absolute imports - add current directory to path if needed
@@ -74,13 +59,11 @@ if _current_dir not in sys.path:
 from rl_model.observation_utils import (
     build_observation,
     calculate_observation_size,
-    print_observation_breakdown
+    print_observation_breakdown,
+    ObservationBuilder
 )
-HAS_OBSERVATION_UTILS = True
 
 
-# Class-level flag to track if we've already warned about missing simulator
-_has_warned_simulator = False
 
 
 class GoMeltEnv(gym.Env):
@@ -212,6 +195,9 @@ class GoMeltEnv(gym.Env):
         self.simulator = None
         self._simulator_initialized = False
         
+        # Observation builder (will be initialized when simulator is ready)
+        self.observation_builder = None
+        
         # Define action and observation spaces
         # Action: normalized power adjustment [-1, 1] -> maps to power range
         self.action_space = spaces.Box(
@@ -280,16 +266,12 @@ class GoMeltEnv(gym.Env):
     def _calculate_observation_size(self) -> int:
         """
         Calculate the observation size based on the observation_config.
-        Uses observation_utils if available, otherwise falls back to manual calculation.
+        Uses observation_utils to calculate observation size.
         """
-        if HAS_OBSERVATION_UTILS and calculate_observation_size is not None:
-            return calculate_observation_size(
-                self.observation_config,
-                self.observation_history_length
-            )
-        else:
-            # Fallback calculation
-            size = 0
+        return calculate_observation_size(
+            self.observation_config,
+            self.observation_history_length
+        )
             if self.observation_config:
                 if self.observation_config.get('enable_max_T_L3', True):
                     size += 1
@@ -304,13 +286,7 @@ class GoMeltEnv(gym.Env):
             return size
     
     def _initialize_simulator(self):
-        """Initialize the persistent GoMeltSimulator instance."""
-        global _has_warned_simulator
-        if not HAS_SIMULATOR or GoMeltSimulator is None:
-            if not _has_warned_simulator:
-                print("Warning: GoMeltSimulator not available. Environment will not work properly.")
-                _has_warned_simulator = True
-            return False
+        """Initialize the persistent GoMeltSimulator instance.""" False
         
         try:
             # Create simulator instance (persistent between resets)
@@ -324,11 +300,34 @@ class GoMeltEnv(gym.Env):
             traceback.print_exc()
             return False
     
-    def _get_observation(self, temperature: float, power: float, laser_all: Optional[np.ndarray] = None, accum_time: Optional[np.ndarray] = None, accum_idx: Optional[int] = None) -> np.ndarray:
+    def _initialize_observation_builder(self):
+        """Initialize the observation builder with toolpath file if available."""
+        if self.observation_builder is not None:
+            return  # Already initialized
+        
+        toolpath_file = None
+        if self.simulator is not None:
+            # Get toolpath file path from simulator
+            if hasattr(self.simulator, 'Nonmesh') and 'toolpath' in self.simulator.Nonmesh:
+                toolpath_file = self.simulator.Nonmesh['toolpath']
+        
+        # Initialize observation builder with toolpath file
+        self.observation_builder = ObservationBuilder(
+            toolpath_file=toolpath_file,
+            observation_config=self.observation_config,
+            power_min=self.power_min,
+            power_max=self.power_max,
+            temp_min=self.temp_min,
+            temp_max=self.temp_max,
+            default_history_length=self.observation_history_length,
+            toolpath_normalization_range=self.observation_config.get('toolpath_normalization_range', 10.0) if self.observation_config else 10.0
+        )
+    
+    def _get_observation(self, temperature: float, power: float, laser_all: Optional[np.ndarray] = None) -> np.ndarray:
         """
         Get observation array with configurable features.
         
-        Uses observation_utils.build_observation if available, otherwise falls back
+        Uses ObservationBuilder class if available, otherwise falls back
         to simple observation format.
         
         Parameters:
@@ -339,27 +338,44 @@ class GoMeltEnv(gym.Env):
             Current power
         laser_all : np.ndarray, optional
             Array of laser positions for speed/distance calculations
-        accum_time : np.ndarray, optional
-            Accumulated time array
-        accum_idx : int, optional
-            Index for accumulated time
             
         Returns:
         --------
         np.ndarray
             Observation array with features specified in observation_config
         """
-        if HAS_OBSERVATION_UTILS and build_observation is not None:
-            # Get levels and properties from simulator
-            levels = None
-            if self.simulator is not None and hasattr(self.simulator, 'Levels'):
-                levels = self.simulator.Levels
-            
-            # Get future/history toolpath (currently not available from simulator)
-            # TODO: If needed, could read toolpath file separately
-            future_toolpath = None
-            history_toolpath = None
-            
+        # Initialize observation builder if not already done
+        if self.observation_builder is None:
+            self._initialize_observation_builder()
+        
+        # Get levels and properties from simulator
+        levels = None
+        if self.simulator is not None and hasattr(self.simulator, 'Levels'):
+            levels = self.simulator.Levels
+        
+        # Get step index from simulator
+        step_index = None
+        if self.simulator is not None:
+            # Get current step index (time_inc tracks the current step)
+            if hasattr(self.simulator, 'time_inc'):
+                step_index = self.simulator.time_inc
+        
+        # Use observation builder to build observation
+        if step_index is not None:
+            return self.observation_builder.build(
+                step_index=step_index,
+                temperature=temperature,
+                power=power,
+                power_history=self.power_history,
+                temperature_history=self.temperature_history,
+                levels=levels,
+                properties=self.properties,
+                laser_all=laser_all,
+                future_toolpath=None,  # Will be loaded from toolpath if needed
+                history_toolpath=None  # Will be loaded from toolpath if needed
+            )
+        else:
+            # Fallback if step_index is not available
             return build_observation(
                 observation_config=self.observation_config,
                 temperature=temperature,
@@ -369,10 +385,10 @@ class GoMeltEnv(gym.Env):
                 levels=levels,
                 properties=self.properties,
                 laser_all=laser_all,
-                accum_time=accum_time,
-                accum_idx=accum_idx,
-                future_toolpath=future_toolpath,
-                history_toolpath=history_toolpath,
+                future_toolpath=None,
+                history_toolpath=None,
+                toolpath_file=None,
+                step_index=None,
                 power_min=self.power_min,
                 power_max=self.power_max,
                 temp_min=self.temp_min,
@@ -380,22 +396,6 @@ class GoMeltEnv(gym.Env):
                 default_history_length=self.observation_history_length,
                 toolpath_normalization_range=self.observation_config.get('toolpath_normalization_range', 10.0) if self.observation_config else 10.0
             )
-        else:
-            # Fallback to simple observation format
-            norm_temp = self._normalize_temperature(temperature)
-            power_hist = self.power_history[-self.observation_history_length:]
-            temp_hist = self.temperature_history[-self.observation_history_length:]
-            
-            norm_power_hist = [self._normalize_power(p) for p in power_hist]
-            norm_temp_hist = [self._normalize_temperature(t) for t in temp_hist]
-            
-            while len(norm_power_hist) < self.observation_history_length:
-                norm_power_hist.insert(0, 0.0)
-            while len(norm_temp_hist) < self.observation_history_length:
-                norm_temp_hist.insert(0, 0.0)
-            
-            obs_list = [norm_temp] + norm_power_hist + norm_temp_hist
-            return np.array(obs_list, dtype=np.float32)
     
     def _action_to_power(self, action: np.ndarray) -> float:
         """
@@ -423,22 +423,6 @@ class GoMeltEnv(gym.Env):
         # Clamp to valid range
         new_power = np.clip(new_power, self.power_min, self.power_max)
         return float(new_power)
-    
-    def _compute_reward(self, temperature: float) -> float:
-        """
-        Compute reward based on temperature error.
-        
-        Reward is negative squared error from target temperature, normalized.
-        """
-        error = self.target_temperature - temperature
-        # Normalize error by target temperature to keep rewards in reasonable range
-        normalized_error = error / self.target_temperature
-        # Scale reward to be in range [-1, 0] when error is small
-        # Use smaller scale to prevent explosion
-        reward = -self.reward_scale * (normalized_error ** 2)
-        # Clip reward to prevent extreme values
-        reward = np.clip(reward, -100.0, 0.0)
-        return float(reward)
     
     def reset(
         self,
@@ -477,22 +461,20 @@ class GoMeltEnv(gym.Env):
         if self.simulator is not None:
             try:
                 self.simulator.reset(self.solver_input, self.config_file)
+                # Reinitialize observation builder with updated toolpath if needed
+                self.observation_builder = None
+                self._initialize_observation_builder()
             except Exception as e:
                 print(f"Warning: Failed to reset simulator: {e}")
                 # Reinitialize if reset fails
                 self._initialize_simulator()
+                self.observation_builder = None
+                self._initialize_observation_builder()
         
         # Get initial temperature from simulator
         if self.simulator is not None and hasattr(self.simulator, 'Levels'):
             # Get initial temperature from simulator state
-            if get_max_temp_L3 is not None:
-                initial_temp = float(get_max_temp_L3(self.simulator.Levels))
-            else:
-                # Fallback: get max from T0 array
-                if HAS_JAX:
-                    initial_temp = float(jnp.max(self.simulator.Levels[3]["T0"]))
-                else:
-                    initial_temp = float(np.max(self.simulator.Levels[3]["T0"]))
+            initial_temp = float(get_max_temp_L3(self.simulator.Levels))
             self._current_temp = initial_temp
         else:
             # Fallback to mock if simulator not available
@@ -506,14 +488,7 @@ class GoMeltEnv(gym.Env):
         # Get initial observation with history (all zeros for history initially)
         laser_all = self._get_laser_all_from_simulator()
         
-        accum_time = None
-        accum_idx = None
-        if self.simulator is not None and hasattr(self.simulator, 'Levels'):
-            if isinstance(self.simulator.Levels, list) and len(self.simulator.Levels) > 0:
-                accum_idx = self.simulator.Levels[0].get("idx", None)
-                accum_time = getattr(self.simulator, 'accum_time', None)
-        
-        observation = self._get_observation(initial_temp, self.current_power, laser_all, accum_time, accum_idx)
+        observation = self._get_observation(initial_temp, self.current_power, laser_all)
         self._last_obs = observation
         
         info = {
@@ -574,14 +549,7 @@ class GoMeltEnv(gym.Env):
             
             # Get current temperature from simulator
             if hasattr(self.simulator, 'Levels') and self.simulator.Levels is not None:
-                if get_max_temp_L3 is not None:
-                    current_temp = float(get_max_temp_L3(self.simulator.Levels))
-                else:
-                    # Fallback: get max from T0 array
-                    if HAS_JAX:
-                        current_temp = float(jnp.max(self.simulator.Levels[3]["T0"]))
-                    else:
-                        current_temp = float(np.max(self.simulator.Levels[3]["T0"]))
+                current_temp = float(get_max_temp_L3(self.simulator.Levels))
                 self._current_temp = current_temp
             else:
                 # Fallback if simulator state not available
@@ -608,24 +576,20 @@ class GoMeltEnv(gym.Env):
         # Construct laser_all array for observation functions
         laser_all = self._get_laser_all_from_simulator()
         
-        # Get accum_time and accum_idx if available
-        accum_time = None
-        accum_idx = None
-        if self.simulator is not None and hasattr(self.simulator, 'Levels'):
-            if isinstance(self.simulator.Levels, list) and len(self.simulator.Levels) > 0:
-                accum_idx = self.simulator.Levels[0].get("idx", None)
-                accum_time = getattr(self.simulator, 'accum_time', None)
-        
         # Update history (before getting observation)
         self.power_history.append(self.current_power)
         self.temperature_history.append(current_temp)
         
         # Get observation with history
-        observation = self._get_observation(current_temp, self.current_power, laser_all, accum_time, accum_idx)
+        observation = self._get_observation(current_temp, self.current_power, laser_all)
         self._last_obs = observation
         
         # Compute reward
-        reward = self._compute_reward(current_temp)
+        reward = compute_reward(
+            temperature=current_temp,
+            target_temperature=self.target_temperature,
+            reward_scale=self.reward_scale
+        )
         self.episode_reward += reward
         self.episode_length += 1
         self.step_count += 1

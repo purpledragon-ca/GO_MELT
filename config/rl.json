@@ -114,8 +114,8 @@
     },
     "nonmesh": {
         "timestep_L3": 1e-05,
-        "dwell_time": 1.0,
-        "wait_time": 0,
+        "dwell_time": 0.0, 
+        "wait_time": 0.0,
         "output_files": 1,
         "record_step": 25,
         "Level1_record_step": 1,
@@ -145,7 +145,6 @@
             "observation_config": {
                 "enable_max_T_L3": false,
                 "enable_frac_above_liquidus": true,
-                "enable_accum_time_local": true,
                 "enable_laser_speed": true,
                 "enable_distance_to_last_point": true,
                 "enable_power_history": true,

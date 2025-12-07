@@ -75,7 +75,7 @@ def parsingGcode(Nonmesh, Properties, L2h):
     # Laser center coordinate (LCC) list (which is read by GO-MELT)
     # Format: (x, y, z, skip_segment, power)
     LCC = []
-    current_z = None  # Default z-coordinate is 0.0
+    current_z = 0.0  # Default z-coordinate is 0.0
     skip_segment = 0.0
     move_mesh = 0
     
@@ -262,3 +262,136 @@ def count_lines(file_path):
 def format_fixed(val, width=15, precision=8):
     formatted = f"{val:.{precision}e}"
     return formatted.rjust(width)
+
+
+if __name__ == "__main__":
+    import json
+    import argparse
+    from pathlib import Path
+    
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(
+        description="Generate toolpath from G-code using rl.json configuration",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+        Examples:
+            python createPath.py
+            python createPath.py config/rl.json
+            python createPath.py config/rl.json --gcode config/gcodefiles/example.gcode
+            """
+    )
+    
+    parser.add_argument(
+        "config_file",
+        type=str,
+        nargs="?",
+        default="config/rl.json",
+        help="Path to rl.json configuration file (default: config/rl.json)"
+    )
+    
+    parser.add_argument(
+        "--gcode",
+        type=str,
+        default="config/gcodefiles/example.gcode",
+        help="Path to G-code input file (default: config/gcodefiles/example.gcode)"
+    )
+    
+    args = parser.parse_args()
+    
+    # Load configuration from rl.json
+    config_path = Path(args.config_file)
+    if not config_path.exists():
+        print(f"Error: Configuration file '{config_path}' not found.")
+        sys.exit(1)
+    
+    try:
+        with open(config_path, "r") as f:
+            config = json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"Error: Failed to parse JSON file '{config_path}': {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: Failed to load configuration file '{config_path}': {e}")
+        sys.exit(1)
+    
+    # Extract configuration sections
+    nonmesh_config = config.get("nonmesh", {})
+    properties_config = config.get("properties", {})
+    
+    # Get G-code file path - use command-line argument if provided, otherwise from config, otherwise default
+    gcode_path = Path(args.gcode)
+    
+    # Resolve relative paths relative to workspace root (where config/ directory is)
+    if not gcode_path.is_absolute():
+        # Get workspace root (parent of config directory)
+        workspace_root = Path(__file__).parent.parent
+        gcode_path = workspace_root / gcode_path
+    
+    if not gcode_path.exists():
+        print(f"Error: G-code file '{gcode_path}' not found.")
+        sys.exit(1)
+    
+    # Create results/Path directory if it doesn't exist
+    workspace_root = Path(__file__).parent.parent
+    results_path = workspace_root / "results" / "Path"
+    results_path.mkdir(parents=True, exist_ok=True)
+    
+    # Set toolpath output path
+    toolpath_path = results_path / "toolpath.txt"
+    
+    # Prepare Nonmesh dictionary
+    Nonmesh = {
+        "gcode": str(gcode_path),
+        "toolpath": str(toolpath_path),
+        "laser_velocity": nonmesh_config.get("laser_velocity", 1000.0),
+        "timestep_L3": nonmesh_config.get("timestep_L3", 1e-5),
+        "dwell_time": nonmesh_config.get("dwell_time", 0.0),
+        "wait_time": nonmesh_config.get("wait_time", 0.0),
+        "dwell_time_multiplier": nonmesh_config.get("dwell_time_multiplier", 8),
+        "subcycle_num_L2": nonmesh_config.get("subcycle_num_L2", 5),
+        "subcycle_num_L3": nonmesh_config.get("subcycle_num_L3", 5)
+    }
+    
+    # Prepare Properties dictionary
+    Properties = {
+        "laser_power": properties_config.get("laser_power", 285.0)
+    }
+    
+    # Get layer height (L2h)
+    L2h = properties_config.get("layer_height", 0.04)
+    
+    # Print configuration summary
+    print("=" * 80)
+    print("GO-MELT Toolpath Generator")
+    print("=" * 80)
+    print(f"Configuration file: {config_path}")
+    print(f"G-code file: {gcode_path}")
+    print(f"Toolpath output: {toolpath_path}")
+    print(f"Laser velocity: {Nonmesh['laser_velocity']} mm/s")
+    print(f"Laser power: {Properties['laser_power']} W")
+    print(f"Layer height: {L2h} mm")
+    print(f"Timestep L3: {Nonmesh['timestep_L3']} s")
+    print("-" * 80)
+    
+    # Generate toolpath
+    try:
+        print("\nGenerating toolpath from G-code...")
+        move_mesh = parsingGcode(Nonmesh, Properties, L2h)
+        
+        # Verify toolpath was created
+        if toolpath_path.exists():
+            lines = count_lines(str(toolpath_path))
+            print(f"\n✓ Toolpath generated successfully!")
+            print(f"  Output file: {toolpath_path}")
+            print(f"  Total lines: {lines}")
+            print(f"  move_mesh: {move_mesh}")
+            print("=" * 80)
+        else:
+            print(f"\n✗ Error: Toolpath file was not created at {toolpath_path}")
+            sys.exit(1)
+            
+    except Exception as e:
+        import traceback
+        print(f"\n✗ Error generating toolpath: {e}")
+        print(traceback.format_exc())
+        sys.exit(1)

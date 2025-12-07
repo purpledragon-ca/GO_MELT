@@ -114,8 +114,8 @@
   },
   "nonmesh": {
     "timestep_L3": 1e-05,
-    "dwell_time": 1.0,
-    "wait_time": 0,
+    "dwell_time": 0.0,
+    "wait_time": 0.0,
     "output_files": 1,
     "record_step": 25,
     "Level1_record_step": 1,
@@ -143,24 +143,23 @@
       "temp_max": 5000.0,
       "rl_model_path": "./rl_training/final_model.zip",
       "observation_config": {
-        "enable_max_T_L3": true,
+        "enable_max_T_L3": false,
         "enable_frac_above_liquidus": true,
-        "enable_accum_time_local": true,
         "enable_laser_speed": true,
         "enable_distance_to_last_point": true,
         "enable_power_history": true,
         "enable_temperature_history": true,
         "enable_future_toolpath": true,
         "enable_history_toolpath": true,
-        "power_history_length": 100,
-        "temperature_history_length": 100,
-        "future_toolpath_length": 100,
-        "history_toolpath_length": 100
+        "power_history_length": 10,
+        "temperature_history_length": 10,
+        "future_toolpath_length": 10,
+        "history_toolpath_length": 10
       }
     }
   },
   "ppo_cfg": {
-    "learning_rate": 1e-05,
+    "learning_rate": 0.0001,
     "n_steps": 2048,
     "batch_size": 64,
     "n_epochs": 10,
