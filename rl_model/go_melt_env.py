@@ -26,7 +26,7 @@ if _parent_dir not in sys.path:
     sys.path.insert(0, _parent_dir)
 
 # Import GoMeltSimulator
-from simulator.simulator import GoMeltSimulator
+from simulator import GoMeltSimulator
 
 # Import JAX
 import jax.numpy as jnp
@@ -48,7 +48,7 @@ get_distance_to_last_point_func = get_distance_to_last_point
 get_temperature_stats_L3 = get_temperature_stats_level3
 
 # Import reward computation function
-from rl_model.reward import compute_reward
+from rl_model.reward import compute_total_reward
 
 # Import observation utilities (from same directory)
 # Use absolute imports - add current directory to path if needed
@@ -155,9 +155,29 @@ class GoMeltEnv(gym.Env):
             
             # Get observation_config if available
             self.observation_config = controller_params.get("observation_config", {})
+            
+            # Get action_multiplier from controller_params or training_cfg
+            self.action_multiplier = controller_params.get("action_multiplier", None)
+            if self.action_multiplier is None and "training_cfg" in self.solver_input:
+                self.action_multiplier = self.solver_input["training_cfg"].get("action_multiplier", 0.2)
+            elif self.action_multiplier is None:
+                self.action_multiplier = 0.2  # Default value
+            
+            # Get action_penalty_coef from training_cfg
+            if "training_cfg" in self.solver_input:
+                self.action_penalty_coef = self.solver_input["training_cfg"].get("action_penalty_coef", 0.01)
+            else:
+                self.action_penalty_coef = 0.01  # Default value
         else:
             self.observation_history_length = observation_history_length
             self.observation_config = {}
+            # Try to get action_multiplier from training_cfg
+            if "training_cfg" in self.solver_input:
+                self.action_multiplier = self.solver_input["training_cfg"].get("action_multiplier", 0.2)
+                self.action_penalty_coef = self.solver_input["training_cfg"].get("action_penalty_coef", 0.01)
+            else:
+                self.action_multiplier = 0.2  # Default value
+                self.action_penalty_coef = 0.01  # Default value
         
         # Ensure RL controller is configured
         if "power_controller" not in self.solver_input:
@@ -272,22 +292,9 @@ class GoMeltEnv(gym.Env):
             self.observation_config,
             self.observation_history_length
         )
-            if self.observation_config:
-                if self.observation_config.get('enable_max_T_L3', True):
-                    size += 1
-                if self.observation_config.get('enable_frac_above_liquidus', False):
-                    size += 1
-                if self.observation_config.get('enable_power_history', True):
-                    size += self.observation_config.get('power_history_length', self.observation_history_length)
-                if self.observation_config.get('enable_temperature_history', True):
-                    size += self.observation_config.get('temperature_history_length', self.observation_history_length)
-            if size == 0:
-                size = 1 + 2 * self.observation_history_length
-            return size
     
     def _initialize_simulator(self):
-        """Initialize the persistent GoMeltSimulator instance.""" False
-        
+        """Initialize the persistent GoMeltSimulator instance."""
         try:
             # Create simulator instance (persistent between resets)
             self.simulator = GoMeltSimulator(self.solver_input, self.config_file, verbose=self.verbose)
@@ -412,8 +419,9 @@ class GoMeltEnv(gym.Env):
         # Option 1: Action is direct power adjustment (relative to current)
         # Use smaller adjustment to prevent large swings
         power_range = self.power_max - self.power_min
-        # Reduce adjustment scale from 0.5 to 0.2 for more stable control
-        power_adjustment = float(action[0]) * power_range * 0.2  # Scale to ±20% of range
+        # Use action_multiplier from config (default 0.2 for ±20% of range)
+        action_multiplier = getattr(self, 'action_multiplier', 0.2)
+        power_adjustment = float(action[0]) * power_range * action_multiplier
         new_power = self.current_power + power_adjustment
         
         # Option 2: Action is absolute power (normalized)
@@ -584,11 +592,14 @@ class GoMeltEnv(gym.Env):
         observation = self._get_observation(current_temp, self.current_power, laser_all)
         self._last_obs = observation
         
-        # Compute reward
-        reward = compute_reward(
+        # Compute total reward with hard-coded coefficients
+        # Extract action value (scalar from array)
+        action_value = float(action[0]) if hasattr(action, '__len__') and len(action) > 0 else float(action)
+        
+        reward = compute_total_reward(
             temperature=current_temp,
             target_temperature=self.target_temperature,
-            reward_scale=self.reward_scale
+            action=action_value
         )
         self.episode_reward += reward
         self.episode_length += 1

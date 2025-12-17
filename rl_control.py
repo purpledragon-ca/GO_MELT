@@ -162,8 +162,8 @@ Examples:
     print("RL Controller Statistics:")
     print("=" * 80)
     history = rl_controller.get_history()
+    import numpy as np
     if history['power']:
-        import numpy as np
         powers = np.array(history['power'])
         print(f"Total power updates: {len(history['power'])}")
         print(f"Mean power: {np.mean(powers):.2f} W")
@@ -171,6 +171,14 @@ Examples:
         print(f"Max power: {np.max(powers):.2f} W")
         print(f"Min power: {np.min(powers):.2f} W")
         print(f"Final power: {current_power:.2f} W")
+        
+        # Calculate and print power error (temperature error)
+        if rl_controller.temperature_history:
+            temperatures = np.array(rl_controller.temperature_history)
+            power_errors = target_temperature - temperatures
+            print(f"Mean power error: {np.mean(power_errors):.2f} K")
+            print(f"Std power error: {np.std(power_errors):.2f} K")
+        
         if rl_controller.use_rl:
             print(f"Controller: RL Agent ({type(rl_controller.rl_model).__name__})")
         else:

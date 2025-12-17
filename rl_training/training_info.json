@@ -1,7 +1,7 @@
 {
   "algorithm": "PPO",
   "total_timesteps": 100000,
-  "training_time_seconds": 1864.584065437317,
+  "training_time_seconds": 2026.3817389011383,
   "config_file": "config/rl.json",
   "env_kwargs": {
     "target_temperature": 3000.0,
@@ -10,6 +10,6 @@
     "base_power": 285.0,
     "update_interval": 10,
     "max_steps": null,
-    "reward_scale": 0.1
+    "reward_scale": 1.0
   }
 }

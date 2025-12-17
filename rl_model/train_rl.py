@@ -184,6 +184,7 @@ def train_rl_agent(
     n_envs: int = 1,
     device_id: int = 0,
     debug: bool = False,
+    checkpoint_path: str = None,
     **env_kwargs
 ):
     """
@@ -196,13 +197,15 @@ def train_rl_agent(
     output_dir : str
         Directory to save training results and model
     total_timesteps : int
-        Total number of training timesteps
+        Total number of training timesteps (additional steps if loading checkpoint)
     n_envs : int
         Number of parallel environments
     device_id : int
         GPU device ID
     debug : bool
         Enable detailed debug printing
+    checkpoint_path : str, optional
+        Path to checkpoint file to load and continue training from
     **env_kwargs
         Additional arguments for environment
     """
@@ -210,6 +213,9 @@ def train_rl_agent(
         raise ImportError("stable-baselines3 is required for training. Install with: pip install stable-baselines3[extra]")
     
     print("Stage: Initializing training...")
+    
+    # Initialize initial_timesteps (will be updated if checkpoint is loaded)
+    initial_timesteps = 0
     
     # Create output directory
     output_path = Path(output_dir)
@@ -239,6 +245,9 @@ def train_rl_agent(
     # Merge config with defaults (config takes precedence)
     ppo_params = {**default_ppo_cfg, **ppo_cfg}
     
+    # Extract policy_kwargs if present (for network architecture)
+    policy_kwargs = ppo_params.pop("policy_kwargs", None)
+    
     # Load training configuration from config file
     training_cfg = config.get("training_cfg", {})
     
@@ -264,12 +273,17 @@ def train_rl_agent(
         print(f"Config file: {config_file}")
         print(f"Output directory: {output_dir}")
         print(f"Total timesteps: {total_timesteps}")
+        if checkpoint_path:
+            print(f"Checkpoint path: {checkpoint_path}")
+            print(f"Initial timesteps: {initial_timesteps:,}")
+            print(f"Target total timesteps: {initial_timesteps + total_timesteps:,}")
         print(f"Number of environments: {n_envs}")
         print(f"PPO parameters from config:")
         for key, value in ppo_params.items():
             print(f"  {key}: {value}")
     else:
-        print(f"  Algorithm: PPO, Timesteps: {total_timesteps:,}, Envs: {n_envs}")
+        checkpoint_info = f" (from checkpoint: {initial_timesteps:,})" if checkpoint_path and initial_timesteps > 0 else ""
+        print(f"  Algorithm: PPO, Timesteps: {total_timesteps:,}{checkpoint_info}, Envs: {n_envs}")
     
     # Create environment
     def make_env():
@@ -350,26 +364,60 @@ def train_rl_agent(
     use_device = "cpu" if device_id < 0 else (f"cuda:{device_id}" if device_id >= 0 else "cpu")
     
     print("Stage: Initializing PPO model...")
-    model = PPO(
-        "MlpPolicy",
-        env,
-        verbose=1 if debug else 0,
-        tensorboard_log=str(output_path / "tensorboard"),
-        device=use_device,
-        learning_rate=ppo_params["learning_rate"],
-        n_steps=ppo_params["n_steps"],
-        batch_size=ppo_params["batch_size"],
-        n_epochs=ppo_params["n_epochs"],
-        gamma=ppo_params["gamma"],
-        gae_lambda=ppo_params["gae_lambda"],
-        clip_range=ppo_params["clip_range"],
-        ent_coef=ppo_params["ent_coef"],
-        max_grad_norm=ppo_params["max_grad_norm"],
-        vf_coef=ppo_params["vf_coef"],
-    )
     
-    if debug:
-        print(f"  Model initialized on {use_device}")
+    # Check if we should load from checkpoint
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        if debug:
+            print(f"  Loading checkpoint from: {checkpoint_path}")
+        try:
+            model = PPO.load(checkpoint_path, env=env, device=use_device)
+            # Try to get the number of timesteps already trained
+            if hasattr(model, 'num_timesteps'):
+                initial_timesteps = model.num_timesteps
+            elif hasattr(model, 'logger') and hasattr(model.logger, 'name_to_value'):
+                # Try to get from logger
+                initial_timesteps = model.logger.name_to_value.get('time/total_timesteps', 0)
+            if debug:
+                print(f"  Loaded checkpoint with {initial_timesteps:,} timesteps already trained")
+            else:
+                print(f"  Loaded checkpoint ({initial_timesteps:,} timesteps)")
+        except Exception as e:
+            print(f"  Warning: Failed to load checkpoint: {e}")
+            if debug:
+                import traceback
+                traceback.print_exc()
+            print("  Creating new model instead...")
+            checkpoint_path = None
+    
+    if checkpoint_path is None or not os.path.exists(checkpoint_path):
+        # Create new model
+        model_kwargs = {
+            "policy": "MlpPolicy",
+            "env": env,
+            "verbose": 1 if debug else 0,
+            "tensorboard_log": str(output_path / "tensorboard"),
+            "device": use_device,
+            "learning_rate": ppo_params["learning_rate"],
+            "n_steps": ppo_params["n_steps"],
+            "batch_size": ppo_params["batch_size"],
+            "n_epochs": ppo_params["n_epochs"],
+            "gamma": ppo_params["gamma"],
+            "gae_lambda": ppo_params["gae_lambda"],
+            "clip_range": ppo_params["clip_range"],
+            "ent_coef": ppo_params["ent_coef"],
+            "max_grad_norm": ppo_params["max_grad_norm"],
+            "vf_coef": ppo_params["vf_coef"],
+        }
+        
+        # Add policy_kwargs if specified (for network architecture)
+        if policy_kwargs is not None:
+            model_kwargs["policy_kwargs"] = policy_kwargs
+            if debug:
+                print(f"  Using custom network architecture: {policy_kwargs.get('net_arch', 'default')}")
+        
+        model = PPO(**model_kwargs)
+        if debug:
+            print(f"  Model initialized on {use_device}")
     
     # Setup callbacks
     print("Stage: Setting up callbacks...")
@@ -410,13 +458,17 @@ def train_rl_agent(
         print("Starting training...")
         print("="*60)
         print(f"Algorithm: PPO")
-        print(f"Total timesteps: {total_timesteps:,}")
+        print(f"Additional timesteps: {total_timesteps:,}")
+        if checkpoint_path and initial_timesteps > 0:
+            print(f"Previous timesteps: {initial_timesteps:,}")
+            print(f"Target total timesteps: {initial_timesteps + total_timesteps:,}")
         print(f"Device: {use_device}")
         print(f"Number of environments: {n_envs}")
         print("="*60 + "\n")
     else:
+        checkpoint_info = f" (continuing from {initial_timesteps:,})" if checkpoint_path and initial_timesteps > 0 else ""
         print("Stage: Starting training...")
-        print(f"  Training PPO model for {total_timesteps:,} timesteps on {use_device}")
+        print(f"  Training PPO model for {total_timesteps:,} timesteps{checkpoint_info} on {use_device}")
     
     start_time = time.time()
     
@@ -496,6 +548,12 @@ def main():
         action="store_true",
         help="Enable detailed debug printing (default: False)"
     )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Path to checkpoint file to load and continue training from (default: None)"
+    )
     
     args = parser.parse_args()
     
@@ -545,6 +603,27 @@ def main():
     max_steps = training_cfg.get("max_steps", None)
     reward_scale = training_cfg.get("reward_scale", 0.1)
     
+    # Get checkpoint path from command line or config
+    checkpoint_path = args.checkpoint or training_cfg.get("checkpoint_path", None)
+    
+    # If no checkpoint specified but we want to load from rl_training, try to find the latest checkpoint
+    if checkpoint_path is None:
+        # Try to find the latest checkpoint in rl_training/checkpoints
+        rl_training_checkpoints = Path(output_dir) / "checkpoints"
+        if rl_training_checkpoints.exists():
+            checkpoint_files = list(rl_training_checkpoints.glob("rl_model_*_steps.zip"))
+            if checkpoint_files:
+                # Sort by step number (extract from filename)
+                def get_steps(filename):
+                    try:
+                        return int(filename.stem.split("_")[-2])
+                    except:
+                        return 0
+                checkpoint_files.sort(key=get_steps, reverse=True)
+                checkpoint_path = str(checkpoint_files[0])
+                if args.debug:
+                    print(f"Found latest checkpoint: {checkpoint_path}")
+    
     # Set GPU device
     if device_id >= 0:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
@@ -563,6 +642,7 @@ def main():
             n_envs=n_envs,
             device_id=device_id,
             debug=args.debug,
+            checkpoint_path=checkpoint_path,
             target_temperature=target_temperature,
             power_min=power_min,
             power_max=power_max,
